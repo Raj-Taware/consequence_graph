@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: consequencegraph
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py --path ./neural_lam_cached --port $PORT
+    envVars:
+      - key: CONSEQUENCEGRAPH_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    plan: free

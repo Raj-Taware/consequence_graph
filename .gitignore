@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.Python
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+ENV/
+
+# codegraph cache — commit neural_lam_cached/cache.json for demo,
+# but never commit live-indexed caches from local development
+.consequencegraph/
+!neural_lam_cached/
+neural_lam_cached/*.json.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+*.log
+uvicorn.log
+server.log
+
+# Type checking
+.mypy_cache/
+.pyright/
+
+# Jupyter (if ever used for exploration)
+.ipynb_checkpoints/
+*.ipynb
+
+# Local env overrides
+.env.local
+*.local
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
