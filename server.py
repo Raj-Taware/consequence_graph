@@ -25,7 +25,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException, Request, Query
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -36,13 +36,24 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PRODUCTION = os.environ.get("CONSEQUENCEGRAPH_ENV") == "production"
-RATE_LIMIT_WINDOW = 60   # seconds
-RATE_LIMIT_MAX    = 60   # requests per window per IP
+RATE_LIMIT_WINDOW = 60        # seconds
+RATE_LIMIT_MAX    = 60        # requests per window per IP
+RATE_BUCKETS_MAX  = 10_000   # max unique IPs tracked (H2: prevent memory leak)
+CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")  # H3: set in render.yaml for production
 
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 
 _rate_buckets: dict = defaultdict(list)
+
+
+def _get_real_ip(request) -> str:
+    """Return real client IP, honouring X-Forwarded-For from proxy/LB (H2)."""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
@@ -51,6 +62,10 @@ def check_rate_limit(ip: str) -> bool:
     if len(_rate_buckets[ip]) >= RATE_LIMIT_MAX:
         return False
     _rate_buckets[ip].append(now)
+    # H2: cap memory — evict oldest IP bucket when map exceeds limit
+    if len(_rate_buckets) > RATE_BUCKETS_MAX:
+        oldest = next(iter(_rate_buckets))
+        del _rate_buckets[oldest]
     return True
 
 
@@ -72,6 +87,8 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
+    if not os.path.isdir(_index_path):  # C1: reject non-existent / non-directory paths
+        raise RuntimeError(f"Index path does not exist or is not a directory: {_index_path}")
     cache = os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
 
     _graph = KnowledgeGraph()
@@ -96,13 +113,13 @@ def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = Fal
 
 app = FastAPI(title="consequencegraph", description="Consequence-aware code knowledge graph")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"])
+app.add_middleware(CORSMiddleware, allow_origins=[CORS_ORIGIN], allow_methods=["GET", "POST"])  # H3
 
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if PRODUCTION and request.url.path.startswith("/api/"):
-        ip = request.client.host if request.client else "unknown"
+        ip = _get_real_ip(request)  # H2: use real IP behind proxy
         if not check_rate_limit(ip):
             return JSONResponse({"error": "Rate limit exceeded. Try again in a minute."}, status_code=429)
     return await call_next(request)
@@ -143,7 +160,7 @@ def api_graph():
 
 
 @app.get("/api/impact/{node_id:path}")
-def api_impact(node_id: str, depth: int = None):
+def api_impact(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2: cap traversal depth
     """Return impact report for a node."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -151,7 +168,7 @@ def api_impact(node_id: str, depth: int = None):
 
 
 @app.get("/api/impact_text/{node_id:path}")
-def api_impact_text(node_id: str, depth: int = None):
+def api_impact_text(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2
     """Return human-readable impact report."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -159,7 +176,7 @@ def api_impact_text(node_id: str, depth: int = None):
 
 
 @app.get("/api/search")
-def api_search(q: str, limit: int = 20):
+def api_search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(20, ge=1, le=100)):  # H4
     """Search nodes by name."""
     g = get_graph()
     results = []
@@ -191,7 +208,7 @@ def api_reindex():
 
 
 @app.get("/api/simulate")
-def api_simulate(node_id: str, change: str, depth: int = None):
+def api_simulate(node_id: str, change: str = Query(..., max_length=500), depth: int = Query(None, ge=1, le=6)):  # H4 + L2
     """
     Given a node and a plain-English change description, classify the change
     type and return an annotated impact report explaining what specifically
@@ -340,8 +357,6 @@ def _annotate_consequence(
         if is_hook:
             return f"Lightning hook `{node_name}` receives data from this pipeline — format change causes runtime failure."
 
-            return f"Lightning hook `{node_name}` receives data from this pipeline — format change causes runtime failure."
-
     # Generic fallback
     return f"`{node_name}` is in the blast radius via `{edge_type}` — verify compatibility after this change."
 
@@ -357,6 +372,8 @@ async def api_reason(request: Request):
     query_text = body.get("query", "").strip()
     if not query_text:
         raise HTTPException(status_code=400, detail="query field required")
+    if len(query_text) > 1000:  # H4: prevent O(n × |query|) regex DoS
+        raise HTTPException(status_code=400, detail="query too long (max 1000 characters)")
 
     graph = get_graph()
     engine = get_engine()
@@ -570,16 +587,19 @@ def _build_reason_summary(intent: str, mentioned_nodes: list, must_change: list,
 
 
 @app.get("/api/diff")
-def api_diff(base: str = "main"):
+def api_diff(base: str = Query("main", max_length=100)):  # C2: validate before passing to git
     """Return impact for all functions changed vs git base branch."""
+    # C2: allowlist — only safe ref characters, reject option-like args
+    if not re.match(r'^[a-zA-Z0-9/_.\.\-]{1,100}$', base) or base.startswith('-'):
+        raise HTTPException(status_code=400, detail="Invalid base ref. Use a valid branch or commit name.")
     try:
         result = subprocess.run(
             ["git", "diff", base, "--name-only"],
             capture_output=True, text=True, cwd=_index_path
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Git error: {e}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2: don't leak internal error
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -810,6 +830,14 @@ const EDGE_COLORS = {
   instantiates: '#79c0ff',
 };
 
+// H1: HTML-escape helper — applied to all user-sourced data before innerHTML insertion
+function _h(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
 let currentZoom = 1;
@@ -1019,20 +1047,20 @@ function renderImpactSidebar(node, impact) {
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${meta.type || node.type}</span>
+      <span class="meta-pill">${_h(meta.type || node.type)}</span>
       ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
-      <span class="severity-badge sev-${sev}">${sev}</span>
+      <span class="severity-badge sev-${_h(sev)}">${_h(sev)}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${meta.line || 0}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
   }
 
   // Tensor shapes
@@ -1043,21 +1071,21 @@ function renderImpactSidebar(node, impact) {
       const conf = typeof info === 'object' ? Math.round((info.confidence || 0) * 100) : null;
       const src = typeof info === 'object' ? info.source : null;
       html += `<div class="shape-row">
-        <span class="shape-param">${param}</span>
-        <span class="shape-val">${shapeVal}</span>
-        ${conf ? `<span class="shape-conf">${conf}% · ${src}</span>` : ''}
+        <span class="shape-param">${_h(param)}</span>
+        <span class="shape-val">${_h(shapeVal)}</span>
+        ${conf ? `<span class="shape-conf">${conf}% · ${_h(src)}</span>` : ''}
       </div>`;
     }
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
       </div></div>`;
   }
 
@@ -1083,10 +1111,10 @@ function renderImpactSidebar(node, impact) {
 function renderImpactNode(e) {
   const sev = e.severity || 'low';
   const name = e.name || e.node.split('.').pop();
-  return `<div class="impact-node sev-${sev}" onclick="selectNodeById('${e.node}')">
-    <div class="node-name">${name}</div>
-    <div class="node-edge">${e.edge_type} · depth ${e.depth}</div>
-    ${e.reason ? `<div class="node-reason">${e.reason.substring(0, 100)}</div>` : ''}
+  return `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
+    <div class="node-name">${_h(name)}</div>
+    <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
+    ${e.reason ? `<div class="node-reason">${_h(e.reason.substring(0, 100))}</div>` : ''}
   </div>`;
 }
 
@@ -1131,9 +1159,9 @@ searchBox.addEventListener('input', async () => {
   const data = await resp.json();
   if (!data.results.length) { searchResults.style.display = 'none'; return; }
   searchResults.innerHTML = data.results.map(r => `
-    <div class="search-result" onclick="selectNodeById('${r.id}'); searchResults.style.display='none'; searchBox.value='';">
-      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${r.name}</span>
-      <span class="node-type">${r.type} · ${r.id.split('.').slice(0,-1).join('.')}</span>
+    <div class="search-result" onclick="selectNodeById('${_h(r.id)}'); searchResults.style.display='none'; searchBox.value='';">
+      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${_h(r.name)}</span>
+      <span class="node-type">${_h(r.type)} · ${_h(r.id.split('.').slice(0,-1).join('.'))}</span>
     </div>`).join('');
   searchResults.style.display = 'block';
 });
@@ -1188,12 +1216,12 @@ function renderReasonSidebar(data) {
   let html = `
     <div style="background:#1a1f2e;border-radius:6px;padding:10px 12px;margin-bottom:12px">
       <div style="font-size:10px;color:#8b949e;margin-bottom:3px">Intent classified as</div>
-      <div style="color:#79c0ff;font-size:12px;font-weight:600">${intentLabels[data.query_intent] || data.query_intent}</div>
+      <div style="color:#79c0ff;font-size:12px;font-weight:600">${_h(intentLabels[data.query_intent] || data.query_intent)}</div>
     </div>`;
 
   // Summary
   if (data.summary) {
-    html += `<div style="color:#8b949e;font-size:11px;line-height:1.6;margin-bottom:12px;padding:8px 10px;background:#0d1117;border-radius:5px">${data.summary}</div>`;
+    html += `<div style="color:#8b949e;font-size:11px;line-height:1.6;margin-bottom:12px;padding:8px 10px;background:#0d1117;border-radius:5px">${_h(data.summary)}</div>`;
   }
 
   // Mentioned nodes
@@ -1201,9 +1229,9 @@ function renderReasonSidebar(data) {
     html += `<div class="impact-section"><h3>Nodes found in query (${data.mentioned_node_details.length})</h3>`;
     data.mentioned_node_details.forEach(n => {
       const fname = (n.file || '').split(/[\/\\]/).pop();
-      html += `<div class="impact-node sev-medium" onclick="selectNodeById('${n.node}')">
-        <div class="node-name">${n.name}</div>
-        <div class="node-edge">${fname}${n.line ? ':' + n.line : ''}</div>
+      html += `<div class="impact-node sev-medium" onclick="selectNodeById('${_h(n.node)}')">
+        <div class="node-name">${_h(n.name)}</div>
+        <div class="node-edge">${_h(fname)}${n.line ? ':' + n.line : ''}</div>
       </div>`;
     });
     html += `</div>`;
@@ -1251,12 +1279,12 @@ function renderReasonSidebar(data) {
 function renderReasonNode(n) {
   const fname = (n.file || '').split(/[\/\\]/).pop();
   const origins = (n.origins || []).slice(0, 3).join(', ');
-  return `<div class="impact-node sev-high" onclick="selectNodeById('${n.node}')">
-    <div class="node-name">${n.name}
+  return `<div class="impact-node sev-high" onclick="selectNodeById('${_h(n.node)}')">
+    <div class="node-name">${_h(n.name)}
       <span style="font-size:9px;color:#6e7681;font-weight:400;margin-left:6px">in ${n.intersection_count} blast radii</span>
     </div>
-    <div class="node-edge">${fname}${n.line ? ':' + n.line : ''} · via ${origins}</div>
-    ${n.annotation ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${n.annotation}</div>` : ''}
+    <div class="node-edge">${_h(fname)}${n.line ? ':' + n.line : ''} · via ${_h(origins)}</div>
+    ${n.annotation ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${_h(n.annotation)}</div>` : ''}
   </div>`;
 }
 
@@ -1314,11 +1342,11 @@ function renderSimulateSidebar(node, impact) {
   let html = `
     <div style="background:#1a1f2e;border-radius:6px;padding:10px 12px;margin-bottom:12px">
       <div style="font-size:10px;color:#8b949e;margin-bottom:4px">Change detected as</div>
-      <div style="color:#79c0ff;font-size:12px;font-weight:600">${changeTypeLabels[changeType] || changeType}</div>
-      <div style="color:#6e7681;font-size:10px;margin-top:4px;font-style:italic">"${impact.change_description}"</div>
+      <div style="color:#79c0ff;font-size:12px;font-weight:600">${_h(changeTypeLabels[changeType] || changeType)}</div>
+      <div style="color:#6e7681;font-size:10px;margin-top:4px;font-style:italic">"${_h(impact.change_description)}"</div>
     </div>
     <div class="meta-row">
-      <span class="severity-badge sev-${sev}">${sev} impact</span>
+      <span class="severity-badge sev-${_h(sev)}">${_h(sev)} impact</span>
       <span class="meta-pill">${br.downstream_count || 0} affected</span>
     </div>`;
 
@@ -1329,7 +1357,7 @@ function renderSimulateSidebar(node, impact) {
         ${impact.critical_path.map((n, i) => {
           const name = n.split('.').pop();
           const color = i === 0 ? '#f85149' : i === impact.critical_path.length - 1 ? '#e3b341' : '#79c0ff';
-          return `<span style="color:${color}">${name}</span>`;
+          return `<span style="color:${color}">${_h(name)}</span>`;
         }).join(' → ')}
       </div></div>`;
   }
@@ -1345,17 +1373,17 @@ function renderSimulateSidebar(node, impact) {
       const sev = e.severity || 'low';
       const name = e.name || e.node.split('.').pop();
       const consequence = e.consequence || e.reason || '';
-      html += `<div class="impact-node sev-${sev}" onclick="selectNodeById('${e.node}')">
-        <div class="node-name">${name}</div>
-        <div class="node-edge">${e.edge_type} · depth ${e.depth}</div>
-        ${consequence ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${consequence}</div>` : ''}
+      html += `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
+        <div class="node-name">${_h(name)}</div>
+        <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
+        ${consequence ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${_h(consequence)}</div>` : ''}
       </div>`;
     });
     html += `</div>`;
   }
 
   document.getElementById('sidebar-title').textContent = `Simulate: ${node.name || selectedNodeId.split('.').pop()}`;
-  document.getElementById('sidebar-content').innerHTML = html;
+  document.getElementById('sidebar-content').innerHTML = html;  // node.name goes via textContent — safe
 }
 
 // Diff
@@ -1369,9 +1397,9 @@ async function loadDiff() {
   let html = `<div style="color:#8b949e;font-size:11px;margin-bottom:10px">
     Changed files: ${data.changed_files.length}</div>`;
   data.impacts.forEach(imp => {
-    html += `<div class="impact-node sev-${imp.severity || 'low'}" onclick="selectNodeById('${imp.target}')">
-      <div class="node-name">${imp.function}</div>
-      <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
+    html += `<div class="impact-node sev-${_h(imp.severity || 'low')}" onclick="selectNodeById('${_h(imp.target)}')">
+      <div class="node-name">${_h(imp.function)}</div>
+      <div class="node-edge">${_h(imp.severity)} · ${imp.downstream_count} downstream</div>
     </div>`;
   });
   document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
@@ -1401,7 +1429,7 @@ def main():
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="consequencegraph visual server")
-    parser.add_argument("--path", default="./neural_lam", help="Path to index")
+    parser.add_argument("--path", default="./neural_lam_cached", help="Path to index")
     parser.add_argument("--preset", default=None, choices=["neural_lam"])
     parser.add_argument("--port", type=int, default=7842)
     parser.add_argument("--reindex", action="store_true")
@@ -1409,7 +1437,7 @@ def main():
 
     build_or_load_graph(args.path, preset=args.preset, force_reindex=args.reindex)
     print(f"[consequencegraph server] Open http://localhost:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")  # M5: enable HTTP access logs
 
 
 if __name__ == "__main__":

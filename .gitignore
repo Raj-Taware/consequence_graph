@@ -63,3 +63,6 @@ server.log
 .Spotlight-V100
 .Trashes
 ehthumbs.db
+
+# Developer utilities — not for deployment
+diagnose.py

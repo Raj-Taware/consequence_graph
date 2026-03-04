@@ -7,6 +7,8 @@ services:
     envVars:
       - key: CONSEQUENCEGRAPH_ENV
         value: production
+      - key: CORS_ALLOW_ORIGIN
+        value: https://consequencegraph.onrender.com
       - key: PORT
         value: 10000
     plan: free
