@@ -26,7 +26,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -101,6 +101,16 @@ def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = Fal
         if preset == "neural_lam":
             from presets.neural_lam import apply
             apply(_graph)
+        elif preset == "wmg":
+            from presets.wmg import apply
+            apply(_graph)
+        elif preset == "wmg_neural_lam":
+            # Both repos indexed together — apply neural-lam domain knowledge
+            # then wmg format contracts + cross-repo edges on top.
+            from presets.neural_lam import apply as apply_nl
+            from presets.wmg import apply as apply_wmg
+            apply_nl(_graph)
+            apply_wmg(_graph)
         _graph.save(cache)
         print(f"[consequencegraph server] Done: {_graph.node_count()} nodes, {_graph.edge_count()} edges")
 
@@ -142,6 +152,11 @@ def api_graph():
             "config_keys": data.get("config_keys", []),
             "in_degree": g.in_degree(nid),
             "out_degree": g.out_degree(nid),
+            # wmg preset fields
+            "is_cross_repo": data.get("is_cross_repo", False),
+            "mismatch_risk": data.get("mismatch_risk", ""),
+            "is_lossiness_boundary": data.get("is_lossiness_boundary", False),
+            "is_critical_preset": data.get("is_critical_preset", False),
         })
 
     edges = []
@@ -988,6 +1003,63 @@ def api_node_context(node_id: str):
     }
 
 
+
+    """
+    Classify a plain-English change description into a structured change type.
+    Returns (change_type, metadata_dict).
+    """
+    desc = description.lower().strip()
+
+    # Signature / argument changes
+    if any(w in desc for w in ["add param", "add argument", "new param", "new argument",
+                                 "remove param", "remove argument", "rename param",
+                                 "change signature", "add kwarg"]):
+        return "signature_change", {"description": description}
+
+    # Return value / output changes
+    if any(w in desc for w in ["return", "output", "tuple", "add tensor", "new tensor",
+                                 "remove tensor", "change return", "yield"]):
+        # Try to extract shape hints from description
+        import re
+        shapes = re.findall(r'\[([^\]]+)\]|\(([^)]+)\)', description)
+        return "return_format_change", {
+            "description": description,
+            "shapes_mentioned": [s[0] or s[1] for s in shapes],
+        }
+
+    # Rename
+    if any(w in desc for w in ["rename", "move", "refactor name"]):
+        return "rename", {"description": description}
+
+    # Data format / schema changes
+    if any(w in desc for w in ["format", "schema", "structure", "field", "key",
+                                 "dict", "batch", "dataset", "datastore"]):
+        return "data_format_change", {"description": description}
+
+    # Dimension / shape changes
+    if any(w in desc for w in ["dim", "shape", "size", "hidden", "channels",
+                                 "feature", "embedding", "d_h", "d_model", "hidden_dim"]):
+        import re
+        dims = re.findall(r'\d+', description)
+        return "dimension_change", {
+            "description": description,
+            "dimensions_mentioned": dims,
+        }
+
+    # Removal
+    if any(w in desc for w in ["remove", "delete", "drop", "deprecate"]):
+        return "removal", {"description": description}
+
+    # Config change
+    if any(w in desc for w in ["config", "hparam", "hyperparameter", "yaml", "setting"]):
+        return "config_change", {"description": description}
+
+    # Default — treat as generic modification
+    return "modification", {"description": description}
+
+
+
+
 @app.get("/api/diff")
 def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before git
     """Return impact for all functions changed vs git base branch."""
@@ -1256,6 +1328,13 @@ const NODE_COLORS = {
   unknown: '#8b949e',
 };
 
+// Cross-repo format contract nodes coloured by mismatch risk (wmg preset)
+const MISMATCH_COLORS = {
+  high:   '#f85149',
+  medium: '#e3b341',
+  low:    '#79c0ff',
+};
+
 const EDGE_COLORS = {
   calls: '#58a6ff',
   inherits: '#d2a8ff',
@@ -1271,7 +1350,6 @@ const EDGE_COLORS = {
 };
 
 // H1: HTML-escape — applied to all server-sourced data before innerHTML
-
 function _h(s) {
   if (s == null) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -1424,8 +1502,18 @@ function renderGraph() {
 
   nodeGroup.append('circle')
     .attr('r', d => Math.max(4, Math.min(14, 3 + d.in_degree * 0.6)))
-    .attr('fill', d => NODE_COLORS[d.type] || '#8b949e')
-    .attr('stroke', d => d.is_lightning_hook ? '#f0883e' : (NODE_COLORS[d.type] || '#8b949e'))
+    .attr('fill', d => {
+      // Cross-repo format contract nodes: colour by mismatch risk
+      if (d.is_cross_repo && d.mismatch_risk && MISMATCH_COLORS[d.mismatch_risk]) {
+        return MISMATCH_COLORS[d.mismatch_risk];
+      }
+      return NODE_COLORS[d.type] || '#8b949e';
+    })
+    .attr('stroke', d => {
+      if (d.is_lossiness_boundary) return '#f85149';  // red ring on from_networkx
+      if (d.is_cross_repo) return '#ffffff';           // white ring on contract nodes
+      return d.is_lightning_hook ? '#f0883e' : (NODE_COLORS[d.type] || '#8b949e');
+    })
     .attr('stroke-opacity', 0.8);
 
   labelEl = nodeGroup.append('text')
@@ -1474,7 +1562,7 @@ async function selectNode(d) {
 
   if (impact.error || impact.ambiguous) {
     document.getElementById('sidebar-content').innerHTML =
-      `<p class="placeholder">${_h(impact.error || 'Ambiguous — multiple matches found.')}</p>`;
+      `<p class="placeholder">${impact.error || 'Ambiguous — multiple matches found.'}</p>`;
     return;
   }
 
@@ -1489,20 +1577,20 @@ function renderImpactSidebar(node, impact) {
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${_h(meta.type || node.type)}</span>
+      <span class="meta-pill">${meta.type || node.type}</span>
       ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
-      <span class="severity-badge sev-${_h(sev)}">${_h(sev)}</span>
+      <span class="severity-badge sev-${sev}">${sev}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${_h(meta.line || 0)}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
   }
 
   // Tensor shapes
@@ -1513,21 +1601,21 @@ function renderImpactSidebar(node, impact) {
       const conf = typeof info === 'object' ? Math.round((info.confidence || 0) * 100) : null;
       const src = typeof info === 'object' ? info.source : null;
       html += `<div class="shape-row">
-        <span class="shape-param">${_h(param)}</span>
-        <span class="shape-val">${_h(shapeVal)}</span>
-        ${conf ? `<span class="shape-conf">${_h(conf)}% · ${_h(src)}</span>` : ''}
+        <span class="shape-param">${param}</span>
+        <span class="shape-val">${shapeVal}</span>
+        ${conf ? `<span class="shape-conf">${conf}% · ${src}</span>` : ''}
       </div>`;
     }
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
       </div></div>`;
   }
 
@@ -1553,10 +1641,10 @@ function renderImpactSidebar(node, impact) {
 function renderImpactNode(e) {
   const sev = e.severity || 'low';
   const name = e.name || e.node.split('.').pop();
-  return `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
-    <div class="node-name">${_h(name)}</div>
-    <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
-    ${e.reason ? `<div class="node-reason">${_h(e.reason.substring(0, 100))}</div>` : ''}
+  return `<div class="impact-node sev-${sev}" onclick="selectNodeById('${e.node}')">
+    <div class="node-name">${name}</div>
+    <div class="node-edge">${e.edge_type} · depth ${e.depth}</div>
+    ${e.reason ? `<div class="node-reason">${e.reason.substring(0, 100)}</div>` : ''}
   </div>`;
 }
 
@@ -1639,8 +1727,8 @@ function renderConsequenceSidebar(data) {
   const intentLabel  = intentLabels[data.intent]  || data.intent;
   const changeLabel  = changeLabels[data.change_type] || '';
   html += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
-    <span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#131d2e;color:#79c0ff;text-transform:uppercase;letter-spacing:.08em">${_h(intentLabel)}</span>
-    ${changeLabel ? `<span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#1a1f2e;color:#8b949e;letter-spacing:.05em">${_h(changeLabel)}</span>` : ''}
+    <span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#131d2e;color:#79c0ff;text-transform:uppercase;letter-spacing:.08em">${intentLabel}</span>
+    ${changeLabel ? `<span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#1a1f2e;color:#8b949e;letter-spacing:.05em">${changeLabel}</span>` : ''}
   </div>`;
 
   // ── Lead card — adaptive per intent ────────────────────────
@@ -1650,7 +1738,7 @@ function renderConsequenceSidebar(data) {
   if (lead.format === 'decision') {
     html += `<div class="lead-type">Decision analysis</div>`;
     if (lead.recommendation) {
-      html += `<div class="lead-rec">→ ${_h(lead.recommendation)}</div>`;
+      html += `<div class="lead-rec">→ ${lead.recommendation}</div>`;
     }
     if (lead.options && lead.options.length) {
       const sorted = [...lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
@@ -1658,8 +1746,8 @@ function renderConsequenceSidebar(data) {
       sorted.forEach((opt, i) => {
         const cheaper = i === 0;
         html += `<div class="option-row">
-          <span class="option-name">${_h(opt.name)}</span>
-          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${_h(opt.downstream_count)} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
+          <span class="option-name">${opt.name}</span>
+          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${opt.downstream_count} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
         </div>`;
       });
       html += `</div>`;
@@ -1667,15 +1755,15 @@ function renderConsequenceSidebar(data) {
 
   } else if (lead.format === 'removal_plan') {
     html += `<div class="lead-type">Removal — cleanup order</div>
-      <div class="lead-summary">${_h(lead.summary)}</div>`;
+      <div class="lead-summary">${lead.summary}</div>`;
     if (lead.ordered_steps && lead.ordered_steps.length) {
       html += `<div class="step-list">`;
       lead.ordered_steps.forEach(s => {
-        html += `<div class="step-row" onclick="selectNodeById('${_h(s.node)}')">
-          <div class="step-num">${_h(s.step)}</div>
+        html += `<div class="step-row" onclick="selectNodeById('${s.node}')">
+          <div class="step-num">${s.step}</div>
           <div>
-            <div class="step-name">${_h(s.name)}</div>
-            <div class="step-action">${_h(s.action)}</div>
+            <div class="step-name">${s.name}</div>
+            <div class="step-action">${s.action}</div>
           </div>
         </div>`;
       });
@@ -1684,15 +1772,15 @@ function renderConsequenceSidebar(data) {
 
   } else if (lead.format === 'step_by_step') {
     html += `<div class="lead-type">Implementation plan</div>
-      <div class="lead-summary">${_h(lead.summary)}</div>`;
+      <div class="lead-summary">${lead.summary}</div>`;
     if (lead.steps && lead.steps.length) {
       html += `<div class="step-list">`;
       lead.steps.forEach(s => {
-        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${_h(s.node)}')"` : ''}>
-          <div class="step-num">${_h(s.step)}</div>
+        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${s.node}')"` : ''}>
+          <div class="step-num">${s.step}</div>
           <div>
-            <div class="step-name">${_h(s.name)}</div>
-            <div class="step-action">${_h(s.action)}</div>
+            <div class="step-name">${s.name}</div>
+            <div class="step-action">${s.action}</div>
           </div>
         </div>`;
       });
@@ -1713,9 +1801,9 @@ function renderConsequenceSidebar(data) {
     html += `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px">`;
     data.mentioned_details.forEach(n => {
       const sevColor = n.severity === 'critical' ? '#f85149' : n.severity === 'high' ? '#e3b341' : '#58a6ff';
-      html += `<div onclick="selectNodeById('${_h(n.node)}')"
+      html += `<div onclick="selectNodeById('${n.node}')"
         style="font-size:10px;padding:3px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:${sevColor};cursor:pointer;white-space:nowrap">
-        ${_h(n.name)}</div>`;
+        ${n.name}</div>`;
     });
     html += `</div>`;
   }
@@ -1732,13 +1820,12 @@ function renderConsequenceSidebar(data) {
       </div>`;
     data.arity_warnings.forEach(w => {
       const fname = (w.file || '').split(/[/\\]/).pop();
-      const loc = fname ? `${_h(fname)}${w.line ? ':' + _h(w.line) : ''}` : '';
-      // Apply _h FIRST then substitute backtick→<code> so injected content can't escape
-      const msg = _h(w.message || '').replace(/`([^`]+)`/g,
+      const loc = fname ? `${fname}${w.line ? ':' + w.line : ''}` : '';
+      const msg = (w.message || '').replace(/`([^`]+)`/g,
         '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#f85149;font-size:10px">$1</code>');
-      html += `<div class="arity-card" onclick="selectNodeById('${_h(w.node)}')">
-        <div class="arity-node">${_h(w.name)}</div>
-        <div class="arity-loc">${loc} · expects ${_h(w.consumer_arity)}-tuple, will receive ${_h(w.source_arity)}-tuple</div>
+      html += `<div class="arity-card" onclick="selectNodeById('${w.node}')">
+        <div class="arity-node">${w.name}</div>
+        <div class="arity-loc">${loc} · expects ${w.consumer_arity}-tuple, will receive ${w.source_arity}-tuple</div>
         <div class="arity-msg">${msg}</div>
       </div>`;
     });
@@ -1784,11 +1871,10 @@ function renderConsequenceSidebar(data) {
 
 function renderCqNode(n, tier) {
   const fname  = (n.file || '').split(/[/\\]/).pop();
-  const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
-  const edges  = (n.edge_types || []).slice(0, 2).map(_h).join(', ');
-  const via    = (n.via || []).map(_h).join(', ');
-  // Apply _h FIRST then backtick→<code> so injected backtick content can't escape
-  const consequence = _h(n.consequence || '').replace(
+  const loc    = fname ? `${fname}${n.line ? ':' + n.line : ''}` : '';
+  const edges  = (n.edge_types || []).slice(0, 2).join(', ');
+  const via    = (n.via || []).join(', ');
+  const consequence = (n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
   );
@@ -1796,13 +1882,13 @@ function renderCqNode(n, tier) {
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
     ? `<span class="cq-edge-badge">shapes</span>` : '';
 
-  return `<div class="cq-node tier-${_h(tier)}" onclick="selectNodeById('${_h(n.node)}')">
+  return `<div class="cq-node tier-${tier}" onclick="selectNodeById('${n.node}')">
     <div class="cq-name">
-      ${_h(n.name)}
+      ${n.name}
       ${hookBadge}${shapesBadge}
       ${edges ? `<span class="cq-edge-badge">${edges}</span>` : ''}
     </div>
-    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${_h(n.intersection_count)} blast radii` : ''}</div>
+    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${n.intersection_count} blast radii` : ''}</div>
     ${consequence ? `<div class="cq-consequence">${consequence}</div>` : ''}
   </div>`;
 }
@@ -1872,9 +1958,9 @@ searchBox.addEventListener('input', async () => {
   const data = await resp.json();
   if (!data.results.length) { searchResults.style.display = 'none'; return; }
   searchResults.innerHTML = data.results.map(r => `
-    <div class="search-result" onclick="selectNodeById('${_h(r.id)}'); searchResults.style.display='none'; searchBox.value='';">
-      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${_h(r.name)}</span>
-      <span class="node-type">${_h(r.type)} · ${_h(r.id.split('.').slice(0,-1).join('.'))}</span>
+    <div class="search-result" onclick="selectNodeById('${r.id}'); searchResults.style.display='none'; searchBox.value='';">
+      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${r.name}</span>
+      <span class="node-type">${r.type} · ${r.id.split('.').slice(0,-1).join('.')}</span>
     </div>`).join('');
   searchResults.style.display = 'block';
 });
@@ -1896,9 +1982,9 @@ async function loadDiff() {
   let html = `<div style="color:#8b949e;font-size:11px;margin-bottom:10px">
     Changed files: ${data.changed_files.length}</div>`;
   data.impacts.forEach(imp => {
-    html += `<div class="impact-node sev-${_h(imp.severity || 'low')}" onclick="selectNodeById('${_h(imp.target)}')">
-      <div class="node-name">${_h(imp.function)}</div>
-      <div class="node-edge">${_h(imp.severity)} · ${_h(imp.downstream_count)} downstream</div>
+    html += `<div class="impact-node sev-${imp.severity || 'low'}" onclick="selectNodeById('${imp.target}')">
+      <div class="node-name">${imp.function}</div>
+      <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
     </div>`;
   });
   document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
@@ -1929,7 +2015,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="consequencegraph visual server")
     parser.add_argument("--path", default="./neural_lam", help="Path to index")
-    parser.add_argument("--preset", default=None, choices=["neural_lam"])
+    parser.add_argument("--preset", default=None, choices=["neural_lam", "wmg", "wmg_neural_lam"])
     parser.add_argument("--port", type=int, default=7842)
     parser.add_argument("--reindex", action="store_true")
     args = parser.parse_args()

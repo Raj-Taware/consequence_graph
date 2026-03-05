@@ -86,13 +86,21 @@ class Indexer:
     def index_path(self, path: str):
         """Index a file or directory."""
         path = os.path.abspath(path)
+        # Self-exclusion: never index the tool's own source files
+        tool_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+
         if os.path.isfile(path) and path.endswith(".py"):
             self._index_file(path)
         elif os.path.isdir(path):
-            for dirpath, _, filenames in os.walk(path):
+            for dirpath, dirnames, filenames in os.walk(path):
                 # Skip hidden dirs and common noise dirs
                 if any(part.startswith(".") or part in ("__pycache__", "node_modules", ".venv", "venv", "build", "dist")
                        for part in dirpath.replace("\\", "/").split("/")):
+                    continue
+                # Bug 2 fix: skip the tool's own directory if it sits inside the target path
+                abs_dirpath = os.path.abspath(dirpath)
+                if abs_dirpath == tool_dir or abs_dirpath.startswith(tool_dir + os.sep):
+                    dirnames.clear()  # prune subtree
                     continue
                 for fname in filenames:
                     if fname.endswith(".py"):

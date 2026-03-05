@@ -115,6 +115,27 @@ class Enricher:
                     severity_weight=EDGE_SEVERITY_WEIGHTS[EdgeType.CONSUMES_FORMAT],
                 ))
 
+        # Bug 1 fix: also connect to common_step and unroll_prediction —
+        # Lightning routes batch through training_step → common_step implicitly.
+        # Static analysis can't see this, so we inject the edge explicitly.
+        common_step_nodes = [
+            nid for nid, d in self.graph.g.nodes(data=True)
+            if d.get("name") in ("common_step", "unroll_prediction", "predict_step",
+                                  "on_validation_epoch_end", "on_train_epoch_end")
+            and d.get("node_type") == NodeType.FUNCTION.value
+        ]
+        for src in dataset_getitem_nodes:
+            for dst in common_step_nodes:
+                self.graph.add_edge(src, dst, EdgeData(
+                    edge_type=EdgeType.CONSUMES_FORMAT,
+                    reason=(
+                        f"Dataset.__getitem__ batch flows through Lightning's lifecycle into "
+                        f"{dst.split('.')[-1]}. Tuple unpacking here breaks if __getitem__ "
+                        f"return structure changes."
+                    ),
+                    severity_weight=EDGE_SEVERITY_WEIGHTS[EdgeType.CONSUMES_FORMAT],
+                ))
+
         # create_graph / build_graph → forward (graph topology feeds GNN)
         graph_builders = [
             nid for nid, d in self.graph.g.nodes(data=True)

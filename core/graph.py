@@ -1,5 +1,5 @@
 """
-Core graph schema for codegraph.
+Core graph schema for consequencegraph.
 Defines node types, edge types, and the central KnowledgeGraph class.
 """
 import json
@@ -103,7 +103,7 @@ class EdgeData:
 class KnowledgeGraph:
     """Central in-memory graph. Wraps NetworkX DiGraph."""
 
-    CACHE_FILE = ".codegraph/cache.json"
+    CACHE_FILE = ".consequencegraph/cache.json"
 
     def __init__(self):
         self.g = nx.MultiDiGraph()
@@ -163,6 +163,18 @@ class KnowledgeGraph:
             if (n.endswith(suffix_key) or n == query)
             and not any(n.startswith(pfx) for pfx in ("tensor_contract::", "config::", "hook::"))
         ]
+
+        # Bug 3 fix: if query is "ClassName.method", enforce that the class name segment
+        # appears immediately before the method in the node ID — prevents __init__ from
+        # matching every class's constructor when querying a specific one.
+        if "." in query:
+            parts = query.split(".")
+            # Build a stricter suffix: require all parts to appear consecutively in the node ID
+            strict_suffix = "." + ".".join(parts)
+            strict_matches = [n for n in suffix_matches if ("." + n).endswith(strict_suffix)
+                              or n == query]
+            if strict_matches:
+                suffix_matches = strict_matches
 
         # Dunder guard for implicit call resolution
         is_dunder = query.startswith("__") and query.endswith("__")
