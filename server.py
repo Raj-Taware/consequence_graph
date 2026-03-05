@@ -25,7 +25,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException, Request, Query
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -36,13 +36,24 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PRODUCTION = os.environ.get("CONSEQUENCEGRAPH_ENV") == "production"
-RATE_LIMIT_WINDOW = 60   # seconds
-RATE_LIMIT_MAX    = 60   # requests per window per IP
+RATE_LIMIT_WINDOW = 60        # seconds
+RATE_LIMIT_MAX    = 60        # requests per window per IP
+RATE_BUCKETS_MAX  = 10_000   # max IPs tracked (H2: evict oldest beyond this)
+CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")  # H3: set in render.yaml
 
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 
 _rate_buckets: dict = defaultdict(list)
+
+
+def _get_real_ip(request) -> str:
+    """Return real client IP, honouring X-Forwarded-For from proxy/LB (H2)."""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
@@ -51,6 +62,10 @@ def check_rate_limit(ip: str) -> bool:
     if len(_rate_buckets[ip]) >= RATE_LIMIT_MAX:
         return False
     _rate_buckets[ip].append(now)
+    # H2: cap memory — evict oldest IP when map exceeds limit
+    if len(_rate_buckets) > RATE_BUCKETS_MAX:
+        oldest = next(iter(_rate_buckets))
+        del _rate_buckets[oldest]
     return True
 
 
@@ -99,13 +114,13 @@ def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = Fal
 
 app = FastAPI(title="consequencegraph", description="Consequence-aware code knowledge graph")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"])
+app.add_middleware(CORSMiddleware, allow_origins=[CORS_ORIGIN], allow_methods=["GET", "POST"])  # H3
 
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if PRODUCTION and request.url.path.startswith("/api/"):
-        ip = request.client.host if request.client else "unknown"
+        ip = _get_real_ip(request)  # H2: real IP behind Render proxy
         if not check_rate_limit(ip):
             return JSONResponse({"error": "Rate limit exceeded. Try again in a minute."}, status_code=429)
     return await call_next(request)
@@ -146,7 +161,7 @@ def api_graph():
 
 
 @app.get("/api/impact/{node_id:path}")
-def api_impact(node_id: str, depth: int = None):
+def api_impact(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2: cap depth
     """Return impact report for a node."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -154,7 +169,7 @@ def api_impact(node_id: str, depth: int = None):
 
 
 @app.get("/api/impact_text/{node_id:path}")
-def api_impact_text(node_id: str, depth: int = None):
+def api_impact_text(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2
     """Return human-readable impact report."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -162,7 +177,7 @@ def api_impact_text(node_id: str, depth: int = None):
 
 
 @app.get("/api/search")
-def api_search(q: str, limit: int = 20):
+def api_search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(20, ge=1, le=100)):  # H4
     """Search nodes by name."""
     g = get_graph()
     results = []
@@ -209,13 +224,20 @@ async def api_consequence(request: Request):
 
     if not query_text:
         raise HTTPException(status_code=400, detail="query field required")
+    if len(query_text) > 1000:  # H4: prevent O(n × |q|) regex DoS
+        raise HTTPException(status_code=400, detail="query too long (max 1000 characters)")
+
+    # C2: validate anchor_id exists in graph before trusting it
+    if anchor_id is not None:
+        if not isinstance(anchor_id, str) or len(anchor_id) > 500:
+            anchor_id = None
 
     graph  = get_graph()
     engine = get_engine()
 
     # 1. Extract mentioned nodes — anchor always included and weighted higher
     mentioned = _cq_extract_nodes(query_text, graph)
-    if anchor_id and anchor_id not in mentioned:
+    if anchor_id and graph.has_node(anchor_id) and anchor_id not in mentioned:  # C2
         mentioned.insert(0, anchor_id)
     if not mentioned:
         return {
@@ -330,7 +352,7 @@ async def api_consequence(request: Request):
         "intent":        intent,
         "change_type":   change_type,
         "query":         query_text,
-        "anchor":        anchor_id,
+        "anchor":        anchor_id if (anchor_id and graph.has_node(anchor_id)) else None,  # M4: only echo valid anchors
         "mentioned":     mentioned,
         "mentioned_details": [
             {
@@ -623,13 +645,13 @@ def _cq_build_lead(
 
 
 @app.get("/api/node_context/{node_id:path}")
-def api_node_context(node_id: str):
+def api_node_context(node_id: str = Query(..., max_length=500)):  # H4
     """Return pre-population context for a node — shown in textarea when user clicks."""
     graph  = get_graph()
     engine = get_engine()
-    data   = graph.get_node(node_id)
-    if not data:
+    if not graph.has_node(node_id):  # C3: validate node exists before reflecting
         return {"error": "Node not found"}
+    data   = graph.get_node(node_id)
 
     name     = data.get("name", node_id.split(".")[-1])
     ntype    = data.get("node_type", "")
@@ -673,73 +695,20 @@ def api_node_context(node_id: str):
 
 
 
-    """
-    Classify a plain-English change description into a structured change type.
-    Returns (change_type, metadata_dict).
-    """
-    desc = description.lower().strip()
-
-    # Signature / argument changes
-    if any(w in desc for w in ["add param", "add argument", "new param", "new argument",
-                                 "remove param", "remove argument", "rename param",
-                                 "change signature", "add kwarg"]):
-        return "signature_change", {"description": description}
-
-    # Return value / output changes
-    if any(w in desc for w in ["return", "output", "tuple", "add tensor", "new tensor",
-                                 "remove tensor", "change return", "yield"]):
-        # Try to extract shape hints from description
-        import re
-        shapes = re.findall(r'\[([^\]]+)\]|\(([^)]+)\)', description)
-        return "return_format_change", {
-            "description": description,
-            "shapes_mentioned": [s[0] or s[1] for s in shapes],
-        }
-
-    # Rename
-    if any(w in desc for w in ["rename", "move", "refactor name"]):
-        return "rename", {"description": description}
-
-    # Data format / schema changes
-    if any(w in desc for w in ["format", "schema", "structure", "field", "key",
-                                 "dict", "batch", "dataset", "datastore"]):
-        return "data_format_change", {"description": description}
-
-    # Dimension / shape changes
-    if any(w in desc for w in ["dim", "shape", "size", "hidden", "channels",
-                                 "feature", "embedding", "d_h", "d_model", "hidden_dim"]):
-        import re
-        dims = re.findall(r'\d+', description)
-        return "dimension_change", {
-            "description": description,
-            "dimensions_mentioned": dims,
-        }
-
-    # Removal
-    if any(w in desc for w in ["remove", "delete", "drop", "deprecate"]):
-        return "removal", {"description": description}
-
-    # Config change
-    if any(w in desc for w in ["config", "hparam", "hyperparameter", "yaml", "setting"]):
-        return "config_change", {"description": description}
-
-    # Default — treat as generic modification
-    return "modification", {"description": description}
-
-
-
 
 @app.get("/api/diff")
-def api_diff(base: str = "main"):
+def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before git
     """Return impact for all functions changed vs git base branch."""
+    if not re.match(r'^[a-zA-Z0-9/_.\.\-]{1,100}$', base) or base.startswith('-'):
+        raise HTTPException(status_code=400, detail="Invalid base ref. Use a valid branch or commit name.")
     try:
         result = subprocess.run(
             ["git", "diff", base, "--name-only"],
             capture_output=True, text=True, cwd=_index_path
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Git error: {e}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2: don't leak paths
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -998,6 +967,14 @@ const EDGE_COLORS = {
   instantiates: '#79c0ff',
 };
 
+// H1: HTML-escape helper — applied to all user-sourced data before innerHTML insertion
+function _h(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
 let currentZoom = 1;
@@ -1195,7 +1172,7 @@ async function selectNode(d) {
 
   if (impact.error || impact.ambiguous) {
     document.getElementById('sidebar-content').innerHTML =
-      `<p class="placeholder">${impact.error || 'Ambiguous — multiple matches found.'}</p>`;
+      `<p class="placeholder">${_h(impact.error || 'Ambiguous — multiple matches found.')}</p>`;
     return;
   }
 
@@ -1210,20 +1187,20 @@ function renderImpactSidebar(node, impact) {
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${meta.type || node.type}</span>
+      <span class="meta-pill">${_h(meta.type || node.type)}</span>
       ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
-      <span class="severity-badge sev-${sev}">${sev}</span>
+      <span class="severity-badge sev-${_h(sev)}">${_h(sev)}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${_h(meta.line || 0)}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
   }
 
   // Tensor shapes
@@ -1234,21 +1211,21 @@ function renderImpactSidebar(node, impact) {
       const conf = typeof info === 'object' ? Math.round((info.confidence || 0) * 100) : null;
       const src = typeof info === 'object' ? info.source : null;
       html += `<div class="shape-row">
-        <span class="shape-param">${param}</span>
-        <span class="shape-val">${shapeVal}</span>
-        ${conf ? `<span class="shape-conf">${conf}% · ${src}</span>` : ''}
+        <span class="shape-param">${_h(param)}</span>
+        <span class="shape-val">${_h(shapeVal)}</span>
+        ${conf ? `<span class="shape-conf">${_h(conf)}% · ${_h(src)}</span>` : ''}
       </div>`;
     }
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
       </div></div>`;
   }
 
@@ -1274,10 +1251,10 @@ function renderImpactSidebar(node, impact) {
 function renderImpactNode(e) {
   const sev = e.severity || 'low';
   const name = e.name || e.node.split('.').pop();
-  return `<div class="impact-node sev-${sev}" onclick="selectNodeById('${e.node}')">
-    <div class="node-name">${name}</div>
-    <div class="node-edge">${e.edge_type} · depth ${e.depth}</div>
-    ${e.reason ? `<div class="node-reason">${e.reason.substring(0, 100)}</div>` : ''}
+  return `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
+    <div class="node-name">${_h(name)}</div>
+    <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
+    ${e.reason ? `<div class="node-reason">${_h(e.reason.substring(0, 100))}</div>` : ''}
   </div>`;
 }
 
@@ -1360,8 +1337,8 @@ function renderConsequenceSidebar(data) {
   const intentLabel  = intentLabels[data.intent]  || data.intent;
   const changeLabel  = changeLabels[data.change_type] || '';
   html += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
-    <span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#131d2e;color:#79c0ff;text-transform:uppercase;letter-spacing:.08em">${intentLabel}</span>
-    ${changeLabel ? `<span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#1a1f2e;color:#8b949e;letter-spacing:.05em">${changeLabel}</span>` : ''}
+    <span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#131d2e;color:#79c0ff;text-transform:uppercase;letter-spacing:.08em">${_h(intentLabel)}</span>
+    ${changeLabel ? `<span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#1a1f2e;color:#8b949e;letter-spacing:.05em">${_h(changeLabel)}</span>` : ''}
   </div>`;
 
   // ── Lead card — adaptive per intent ────────────────────────
@@ -1371,7 +1348,7 @@ function renderConsequenceSidebar(data) {
   if (lead.format === 'decision') {
     html += `<div class="lead-type">Decision analysis</div>`;
     if (lead.recommendation) {
-      html += `<div class="lead-rec">→ ${lead.recommendation}</div>`;
+      html += `<div class="lead-rec">→ ${_h(lead.recommendation)}</div>`;
     }
     if (lead.options && lead.options.length) {
       const sorted = [...lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
@@ -1379,8 +1356,8 @@ function renderConsequenceSidebar(data) {
       sorted.forEach((opt, i) => {
         const cheaper = i === 0;
         html += `<div class="option-row">
-          <span class="option-name">${opt.name}</span>
-          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${opt.downstream_count} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
+          <span class="option-name">${_h(opt.name)}</span>
+          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${_h(opt.downstream_count)} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
         </div>`;
       });
       html += `</div>`;
@@ -1388,15 +1365,15 @@ function renderConsequenceSidebar(data) {
 
   } else if (lead.format === 'removal_plan') {
     html += `<div class="lead-type">Removal — cleanup order</div>
-      <div class="lead-summary">${lead.summary}</div>`;
+      <div class="lead-summary">${_h(lead.summary)}</div>`;
     if (lead.ordered_steps && lead.ordered_steps.length) {
       html += `<div class="step-list">`;
       lead.ordered_steps.forEach(s => {
-        html += `<div class="step-row" onclick="selectNodeById('${s.node}')">
-          <div class="step-num">${s.step}</div>
+        html += `<div class="step-row" onclick="selectNodeById('${_h(s.node)}')">
+          <div class="step-num">${_h(s.step)}</div>
           <div>
-            <div class="step-name">${s.name}</div>
-            <div class="step-action">${s.action}</div>
+            <div class="step-name">${_h(s.name)}</div>
+            <div class="step-action">${_h(s.action)}</div>
           </div>
         </div>`;
       });
@@ -1405,15 +1382,15 @@ function renderConsequenceSidebar(data) {
 
   } else if (lead.format === 'step_by_step') {
     html += `<div class="lead-type">Implementation plan</div>
-      <div class="lead-summary">${lead.summary}</div>`;
+      <div class="lead-summary">${_h(lead.summary)}</div>`;
     if (lead.steps && lead.steps.length) {
       html += `<div class="step-list">`;
       lead.steps.forEach(s => {
-        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${s.node}')"` : ''}>
-          <div class="step-num">${s.step}</div>
+        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${_h(s.node)}')"` : ''}>
+          <div class="step-num">${_h(s.step)}</div>
           <div>
-            <div class="step-name">${s.name}</div>
-            <div class="step-action">${s.action}</div>
+            <div class="step-name">${_h(s.name)}</div>
+            <div class="step-action">${_h(s.action)}</div>
           </div>
         </div>`;
       });
@@ -1434,9 +1411,9 @@ function renderConsequenceSidebar(data) {
     html += `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px">`;
     data.mentioned_details.forEach(n => {
       const sevColor = n.severity === 'critical' ? '#f85149' : n.severity === 'high' ? '#e3b341' : '#58a6ff';
-      html += `<div onclick="selectNodeById('${n.node}')"
+      html += `<div onclick="selectNodeById('${_h(n.node)}')"
         style="font-size:10px;padding:3px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:${sevColor};cursor:pointer;white-space:nowrap">
-        ${n.name}</div>`;
+        ${_h(n.name)}</div>`;
     });
     html += `</div>`;
   }
@@ -1480,10 +1457,11 @@ function renderConsequenceSidebar(data) {
 
 function renderCqNode(n, tier) {
   const fname  = (n.file || '').split(/[/\\]/).pop();
-  const loc    = fname ? `${fname}${n.line ? ':' + n.line : ''}` : '';
-  const edges  = (n.edge_types || []).slice(0, 2).join(', ');
-  const via    = (n.via || []).join(', ');
-  const consequence = (n.consequence || '').replace(
+  const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
+  const edges  = (n.edge_types || []).slice(0, 2).map(_h).join(', ');
+  const via    = (n.via || []).map(_h).join(', ');
+  // consequence text uses backtick→<code> substitution — apply _h FIRST, then substitute
+  const consequence = _h(n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
   );
@@ -1491,13 +1469,13 @@ function renderCqNode(n, tier) {
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
     ? `<span class="cq-edge-badge">shapes</span>` : '';
 
-  return `<div class="cq-node tier-${tier}" onclick="selectNodeById('${n.node}')">
+  return `<div class="cq-node tier-${_h(tier)}" onclick="selectNodeById('${_h(n.node)}')">
     <div class="cq-name">
-      ${n.name}
+      ${_h(n.name)}
       ${hookBadge}${shapesBadge}
       ${edges ? `<span class="cq-edge-badge">${edges}</span>` : ''}
     </div>
-    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${n.intersection_count} blast radii` : ''}</div>
+    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${_h(n.intersection_count)} blast radii` : ''}</div>
     ${consequence ? `<div class="cq-consequence">${consequence}</div>` : ''}
   </div>`;
 }
@@ -1567,9 +1545,9 @@ searchBox.addEventListener('input', async () => {
   const data = await resp.json();
   if (!data.results.length) { searchResults.style.display = 'none'; return; }
   searchResults.innerHTML = data.results.map(r => `
-    <div class="search-result" onclick="selectNodeById('${r.id}'); searchResults.style.display='none'; searchBox.value='';">
-      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${r.name}</span>
-      <span class="node-type">${r.type} · ${r.id.split('.').slice(0,-1).join('.')}</span>
+    <div class="search-result" onclick="selectNodeById('${_h(r.id)}'); searchResults.style.display='none'; searchBox.value='';">
+      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${_h(r.name)}</span>
+      <span class="node-type">${_h(r.type)} · ${_h(r.id.split('.').slice(0,-1).join('.'))}</span>
     </div>`).join('');
   searchResults.style.display = 'block';
 });
@@ -1591,9 +1569,9 @@ async function loadDiff() {
   let html = `<div style="color:#8b949e;font-size:11px;margin-bottom:10px">
     Changed files: ${data.changed_files.length}</div>`;
   data.impacts.forEach(imp => {
-    html += `<div class="impact-node sev-${imp.severity || 'low'}" onclick="selectNodeById('${imp.target}')">
-      <div class="node-name">${imp.function}</div>
-      <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
+    html += `<div class="impact-node sev-${_h(imp.severity || 'low')}" onclick="selectNodeById('${_h(imp.target)}')">
+      <div class="node-name">${_h(imp.function)}</div>
+      <div class="node-edge">${_h(imp.severity)} · ${_h(imp.downstream_count)} downstream</div>
     </div>`;
   });
   document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
@@ -1631,7 +1609,7 @@ def main():
 
     build_or_load_graph(args.path, preset=args.preset, force_reindex=args.reindex)
     print(f"[consequencegraph server] Open http://localhost:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")  # M3: enable access logs
 
 
 if __name__ == "__main__":
