@@ -25,7 +25,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi import FastAPI, HTTPException, Request, Query, Path
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -645,7 +645,7 @@ def _cq_build_lead(
 
 
 @app.get("/api/node_context/{node_id:path}")
-def api_node_context(node_id: str = Query(..., max_length=500)):  # H4
+def api_node_context(node_id: str = Path(..., max_length=500)):  # H4: path param limit via Path()
     """Return pre-population context for a node — shown in textarea when user clicks."""
     graph  = get_graph()
     engine = get_engine()
