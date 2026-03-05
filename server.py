@@ -9,6 +9,7 @@ Run:
 import json
 import os
 import re
+import ast
 import sys
 import argparse
 import subprocess
@@ -360,6 +361,17 @@ async def api_consequence(request: Request):
     # 7. Highlighted node IDs for graph
     highlighted = set(mentioned) | {n["node"] for n in will_break + likely_need + be_aware}
 
+    # 8. Tuple arity mismatch analysis — for return format / tensor addition changes
+    arity_warnings = []
+    if change_type in ("return_format_change", "add_tensor_component") and mentioned:
+        primary = mentioned[0]
+        new_arity = _infer_arity_delta(query_text, primary, graph)
+        if new_arity is not None:
+            mismatches = _check_arity_mismatches(primary, graph, new_arity)
+            for m in mismatches:
+                highlighted.add(m["node"])
+            arity_warnings = mismatches
+
     return {
         "intent":        intent,
         "change_type":   change_type,
@@ -380,6 +392,7 @@ async def api_consequence(request: Request):
         "will_break":    will_break,
         "likely_need":   likely_need,
         "be_aware":      be_aware,
+        "arity_warnings": arity_warnings,
         "highlighted":   list(highlighted),
     }
 
@@ -424,31 +437,228 @@ def _is_external_node(node_id: str, file_path: str) -> bool:
     return False
 
 
-def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list:
+# ── Tuple arity analysis ──────────────────────────────────────────────────────
+
+def _parse_return_arity(file_path: str, func_name: str) -> int | None:
+    """
+    Re-parse the source file and find the dominant return tuple arity for func_name.
+    Returns the most common tuple length across all return statements, or None if
+    the function doesn't return a tuple or the file can't be parsed.
+    """
+    if not file_path or file_path.startswith("<") or not os.path.isfile(file_path):
+        return None
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=file_path)
+    except SyntaxError:
+        return None
+
+    arities = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.Return) and stmt.value is not None:
+                    if isinstance(stmt.value, ast.Tuple):
+                        arities.append(len(stmt.value.elts))
+    if not arities:
+        return None
+    # Return the most common arity (handles functions with multiple return paths)
+    from collections import Counter
+    return Counter(arities).most_common(1)[0][0]
+
+
+def _parse_unpack_arity(file_path: str, func_name: str) -> int | None:
+    """
+    Re-parse the source file and find tuple unpacking patterns in func_name that
+    receive from a variable named 'batch', or the first argument after 'self'.
+    Returns the unpack arity, or None if no unpacking found.
+
+    Detects patterns like:
+      a, b, c, d = batch
+      (a, b, c) = batch
+      init_states, target_states, forcing, static = batch
+    """
+    if not file_path or file_path.startswith("<") or not os.path.isfile(file_path):
+        return None
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=file_path)
+    except SyntaxError:
+        return None
+
+    # Known batch-carrying variable names in PyTorch Lightning
+    _BATCH_VARS = {"batch", "batch_data", "data", "sample", "item"}
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            # Also collect parameter names (first non-self arg is often the batch)
+            params = [a.arg for a in node.args.args if a.arg != "self"]
+            batch_names = _BATCH_VARS | (set(params[:1]) if params else set())
+
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.Assign):
+                    # LHS is a tuple unpack
+                    if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Tuple):
+                        # RHS is one of the batch variable names
+                        rhs = stmt.value
+                        rhs_name = None
+                        if isinstance(rhs, ast.Name):
+                            rhs_name = rhs.id
+                        elif isinstance(rhs, ast.Subscript) and isinstance(rhs.value, ast.Name):
+                            rhs_name = rhs.value.id
+                        if rhs_name and rhs_name in batch_names:
+                            return len(stmt.targets[0].elts)
+    return None
+
+
+def _check_arity_mismatches(
+    source_node_id: str,
+    graph: KnowledgeGraph,
+    simulated_new_arity: int | None,
+) -> list[dict]:
+    """
+    For a given source node (e.g. __getitem__), find all downstream consumes_format
+    nodes, compute their unpack arity, and report mismatches against the simulated
+    new return arity.
+
+    Returns a list of mismatch dicts:
+      { node, name, file, line, expected_arity, actual_arity, variables, message }
+    """
+    if simulated_new_arity is None:
+        return []
+
+    mismatches = []
+    # Walk downstream edges for consumes_format
+    for _, dst, edge_data in graph.g.out_edges(source_node_id, data=True):
+        if edge_data.get("edge_type") != "consumes_format":
+            continue
+        dst_data = graph.get_node(dst) or {}
+        dst_file  = dst_data.get("file_path", "")
+        dst_name  = dst_data.get("name", dst.split(".")[-1])
+        dst_line  = dst_data.get("line_no", 0)
+
+        unpack_arity = _parse_unpack_arity(dst_file, dst_name)
+        if unpack_arity is None:
+            continue
+        if unpack_arity == simulated_new_arity:
+            continue  # no mismatch
+
+        # Mismatch — build a precise message
+        if simulated_new_arity > unpack_arity:
+            msg = (
+                f"`{dst_name}` unpacks {unpack_arity} values from batch "
+                f"but the modified source now returns {simulated_new_arity} — "
+                f"`ValueError: too many values to unpack` at runtime."
+            )
+        else:
+            msg = (
+                f"`{dst_name}` expects {unpack_arity} values from batch "
+                f"but the modified source now returns {simulated_new_arity} — "
+                f"`ValueError: not enough values to unpack` at runtime."
+            )
+
+        mismatches.append({
+            "node":            dst,
+            "name":            dst_name,
+            "file":            dst_file,
+            "line":            dst_line,
+            "consumer_arity":  unpack_arity,
+            "source_arity":    simulated_new_arity,
+            "message":         msg,
+        })
+
+    return mismatches
+
+
+def _infer_arity_delta(query: str, source_node_id: str, graph: KnowledgeGraph) -> int | None:
+    """
+    Infer what the new return arity would be after the described change.
+    Returns the new arity if we can determine it, else None.
+
+    Cases:
+      - "add a tensor"  / "add ... to return" → current + 1
+      - "remove tensor" / "remove ... from return" → current - 1
+      - explicit number mentioned → use that
+    """
+    node_data = graph.get_node(source_node_id) or {}
+    file_path = node_data.get("file_path", "")
+    func_name = node_data.get("name", source_node_id.split(".")[-1])
+    current_arity = _parse_return_arity(file_path, func_name)
+
+    if current_arity is None:
+        return None
+
+    q = query.lower()
+
+    # Explicit "N tensors" / "N elements" — rare but handle it
+    explicit = re.search(r'\b(\d)\s*(?:tensor|item|element|value|field)', q)
+    if explicit:
+        return int(explicit.group(1))
+
+    if any(w in q for w in ["add", "append", "include", "extra", "additional", "new tensor",
+                              "new field", "introduce"]):
+        return current_arity + 1
+
+    if any(w in q for w in ["remove", "drop", "delete", "strip", "exclude"]):
+        return max(1, current_arity - 1)
+
+    return None
+
+
+
+    """
+    Extract codebase node IDs mentioned in free-form query text.
+
+    Bug 1 fix: polymorphic methods (same name, multiple class implementations)
+    are grouped. Only the most structurally central representative is returned
+    per name, annotated with a sibling count so the UI can note "and N others".
+    This prevents get_xy appearing 3 times in the mentioned list.
+    """
     found, seen = [], set()
+
+    # Build candidates, skipping externals and stopwords
     candidates = []
     for nid, data in graph.g.nodes(data=True):
-        # Bug 6: skip external nodes entirely from NLP extraction
         if _is_external_node(nid, data.get("file_path", "")):
             continue
         name = data.get("name", "")
-        if name and len(name) > 3:
-            candidates.append((nid, name))
+        if name and len(name) > 3 and name.lower() not in _NLP_STOPWORDS:
+            candidates.append((nid, name, data))
         parts = nid.split(".")
-        if len(parts) >= 2:
-            candidates.append((nid, parts[-2]))
-            candidates.append((nid, parts[-1]))
-    deduped = list({(n, nm): None for n, nm in candidates}.keys())
+        for part in parts[-2:]:
+            if part and len(part) > 3 and part.lower() not in _NLP_STOPWORDS:
+                candidates.append((nid, part, data))
+
+    # Deduplicate (nid, name) pairs
+    deduped_map: dict = {}
+    for nid, name, data in candidates:
+        key = (nid, name.lower())
+        if key not in deduped_map:
+            deduped_map[key] = (nid, name, data)
+    deduped = list(deduped_map.values())
+    # Longer names first — more specific matches win
     deduped.sort(key=lambda x: -len(x[1]))
-    for nid, name in deduped:
-        if nid in seen:
-            continue
-        # Bug 4: skip stopwords — don't match narrative English as code nodes
-        if name.lower() in _NLP_STOPWORDS:
-            continue
+
+    # Group matches by name to detect polymorphic implementations
+    # name_lower → list of (nid, data)
+    name_matches: dict[str, list] = {}
+    for nid, name, data in deduped:
+        nl = name.lower()
         if re.search(r'\b' + re.escape(name) + r'\b', query, re.IGNORECASE):
-            found.append(nid)
-            seen.add(nid)
+            name_matches.setdefault(nl, []).append((nid, data))
+
+    # For each matched name, pick the most structurally central node as representative
+    for nl, group in name_matches.items():
+        # Sort by graph degree descending — most connected = most representative
+        group.sort(key=lambda x: -(graph.in_degree(x[0]) + graph.out_degree(x[0])))
+        best_nid, best_data = group[0]
+        if best_nid in seen:
+            continue
+        found.append(best_nid)
+        seen.add(best_nid)
+
     return found[:10]
 
 
@@ -596,6 +806,29 @@ def _cq_build_lead(
                 "downstream_count": len(downstream),
                 "severity": impact.get("severity", "low"),
             })
+        options.sort(key=lambda x: x["downstream_count"])
+
+        # Bug 2 fix: deduplicate by name — polymorphic implementations of the same
+        # method are NOT valid alternatives to compare (self-referential comparison).
+        # Keep the one with the highest downstream count as the representative.
+        seen_names: dict = {}
+        for opt in options:
+            nm = opt["name"]
+            if nm not in seen_names or opt["downstream_count"] > seen_names[nm]["downstream_count"]:
+                seen_names[nm] = opt
+        options = list(seen_names.values())
+
+        # Bug 3 fix: drop container nodes that are parents of other options.
+        # Comparing ARModel vs ARModel.unroll_prediction is a category error —
+        # the class contains the method; they're not peer alternatives.
+        option_ids = {o["node"] for o in options}
+        options = [
+            o for o in options
+            if not any(
+                other != o["node"] and other.startswith(o["node"] + ".")
+                for other in option_ids
+            )
+        ]
         options.sort(key=lambda x: x["downstream_count"])
 
         if len(options) >= 2:
@@ -758,7 +991,7 @@ def api_node_context(node_id: str):
 @app.get("/api/diff")
 def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before git
     """Return impact for all functions changed vs git base branch."""
-    if not re.match(r'^[a-zA-Z0-9/_.\.\-]{1,100}$', base) or base.startswith('-'):
+    if not re.match(r'^[a-zA-Z0-9/_.\-]{1,100}$', base) or base.startswith('-'):
         raise HTTPException(status_code=400, detail="Invalid base ref.")
     try:
         result = subprocess.run(
@@ -952,6 +1185,228 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .option-name { font-size:11px; color:#e6edf3; }
   .option-cost { font-size:10px; color:#8b949e; }
   .option-cost.cheaper { color:#3fb950; }
+
+  /* ── Arity warning panel ────────────────────────────────── */
+  .arity-panel { margin-top:14px; }
+  .arity-banner { display:flex; align-items:center; gap:8px; padding:9px 12px; background:#1a0a0a; border:1px solid #f8514966; border-radius:6px; margin-bottom:8px; }
+  .arity-icon { font-size:14px; }
+  .arity-label { font-size:11px; color:#f85149; font-weight:700; }
+  .arity-sublabel { font-size:10px; color:#8b949e; margin-top:1px; }
+  .arity-card { padding:9px 12px; background:#0d1117; border:1px solid #f8514933; border-left:3px solid #f85149; border-radius:6px; margin-bottom:6px; cursor:pointer; }
+  .arity-card .arity-node { font-size:12px; font-weight:600; color:#f85149; }
+  .arity-card .arity-loc  { font-size:10px; color:#6e7681; margin-top:1px; }
+  .arity-card .arity-msg  { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <h1>⬡ consequencegraph</h1>
+  <input id="search-box" type="text" placeholder="Search nodes... (function, class, module)" autocomplete="off">
+  <div id="search-results"></div>
+  <button id="btn-diff" onclick="loadDiff()">⎇ Diff vs main</button>
+  <button id="btn-reindex" onclick="reindex()">↺ Reindex</button>
+  <span id="stats-bar">loading...</span>
+</div>
+
+<div id="main">
+  <div id="graph-container">
+    <div id="loading">Loading graph...</div>
+    <svg id="graph-svg"></svg>
+    <div id="legend">
+      <h4>Node types</h4>
+      <div class="legend-row"><div class="legend-dot" style="background:#58a6ff"></div>function</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#d2a8ff"></div>class</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#f0883e"></div>lightning hook</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#f85149"></div>tensor contract</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#e3b341"></div>config key</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#3fb950"></div>module</div>
+    </ul>
+    </div>
+  </div>
+
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <h2 id="sidebar-title">Click a node to explore</h2>
+    </div>
+    <div id="sidebar-content">
+      <p class="placeholder">Select any node in the graph to see its impact analysis, dependencies, and downstream consequences.</p>
+    </div>
+    <div id="consequence-panel">
+      <div class="panel-label">
+        ⚡ View Consequence
+        <span id="cq-hint">click a node to pre-fill context</span>
+      </div>
+      <textarea id="consequence-query" rows="3"
+        placeholder="Describe a change, design question, or idea — mention function and class names directly.&#10;e.g. 'Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple'"></textarea>
+      <button id="btn-consequence" onclick="runConsequence()">Analyse consequences →</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const NODE_COLORS = {
+  function: '#58a6ff',
+  class: '#d2a8ff',
+  module: '#3fb950',
+  config_key: '#e3b341',
+  tensor_contract: '#f85149',
+  lightning_hook: '#f0883e',
+  data_format: '#79c0ff',
+  unknown: '#8b949e',
+};
+
+const EDGE_COLORS = {
+  calls: '#58a6ff',
+  inherits: '#d2a8ff',
+  produces_tensor_for: '#f85149',
+  overrides_hook: '#f0883e',
+  consumes_format: '#e3b341',
+  reads_config: '#3fb950',
+  writes_config: '#56d364',
+  named_reference: '#8b949e',
+  imports: '#21262d',
+  defined_in: '#21262d',
+  instantiates: '#79c0ff',
+};
+
+// H1: HTML-escape — applied to all server-sourced data before innerHTML
+</script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  #topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+  #topbar h1 { font-size: 14px; font-weight: 600; color: #58a6ff; letter-spacing: 0.05em; }
+  #search-box { flex: 1; max-width: 320px; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 12px; outline: none; }
+  #search-box:focus { border-color: #58a6ff; }
+  #search-results { position: absolute; top: 44px; left: 180px; width: 320px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; z-index: 100; max-height: 300px; overflow-y: auto; display: none; }
+  .search-result { padding: 8px 12px; cursor: pointer; font-size: 12px; border-bottom: 1px solid #21262d; }
+  .search-result:hover { background: #1f2937; }
+  .search-result .node-type { font-size: 10px; color: #8b949e; margin-left: 6px; }
+
+  #btn-diff { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
+  #btn-diff:hover { border-color: #58a6ff; color: #58a6ff; }
+  #btn-reindex { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
+  #stats-bar { font-size: 11px; color: #8b949e; margin-left: auto; }
+
+  #main { display: flex; flex: 1; overflow: hidden; }
+  #graph-container { flex: 1; position: relative; overflow: hidden; }
+  svg { width: 100%; height: 100%; }
+
+  #sidebar { width: 360px; background: #161b22; border-left: 1px solid #30363d; overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+  #sidebar-header { padding: 14px 16px; border-bottom: 1px solid #30363d; }
+  #sidebar-header h2 { font-size: 13px; color: #58a6ff; }
+  #sidebar-content { padding: 14px 16px; flex: 1; font-size: 12px; line-height: 1.6; }
+  #sidebar-content .placeholder { color: #8b949e; font-style: italic; }
+
+  .impact-section { margin-top: 14px; }
+  .impact-section h3 { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .impact-node { padding: 7px 10px; margin-bottom: 5px; border-radius: 5px; border-left: 3px solid transparent; cursor: pointer; }
+  .impact-node:hover { background: #21262d; }
+  .impact-node.sev-high { border-color: #f85149; }
+  .impact-node.sev-medium { border-color: #e3b341; }
+  .impact-node.sev-low { border-color: #3fb950; }
+  .impact-node .node-name { font-weight: 600; font-size: 12px; }
+  .impact-node .node-edge { font-size: 10px; color: #8b949e; margin-top: 2px; }
+  .impact-node .node-reason { font-size: 10px; color: #6e7681; margin-top: 3px; line-height: 1.4; }
+
+  .severity-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; margin-left: 8px; }
+  .sev-critical { background: #490202; color: #f85149; }
+  .sev-high { background: #2d1f03; color: #e3b341; }
+  .sev-medium { background: #0d2211; color: #3fb950; }
+  .sev-low { background: #131d2e; color: #58a6ff; }
+
+  .meta-row { display: flex; gap: 6px; margin-bottom: 4px; flex-wrap: wrap; }
+  .meta-pill { padding: 2px 7px; background: #21262d; border-radius: 10px; font-size: 10px; color: #8b949e; }
+  .meta-pill.hook { background: #1a1f2e; color: #79c0ff; }
+  .meta-pill.tensor { background: #1f1a2e; color: #d2a8ff; }
+
+  .shapes-block { background: #0d1117; border-radius: 4px; padding: 8px; font-size: 11px; margin-top: 6px; overflow-x: auto; }
+  .shapes-block .shape-row { display: flex; gap: 8px; margin-bottom: 3px; }
+  .shapes-block .shape-param { color: #79c0ff; }
+  .shapes-block .shape-val { color: #d2a8ff; }
+  .shapes-block .shape-conf { color: #6e7681; font-size: 10px; }
+
+  #legend { position: absolute; bottom: 16px; left: 16px; background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 8px; padding: 10px 14px; font-size: 11px; }
+  #legend h4 { color: #8b949e; font-size: 10px; text-transform: uppercase; margin-bottom: 6px; }
+  .legend-row { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #8b949e; font-size: 13px; }
+
+  .node { cursor: pointer; }
+  .node circle { stroke-width: 1.5px; transition: r 0.15s; }
+  .node:hover circle { stroke-width: 2.5px; }
+  .node.selected circle { stroke-width: 3px; }
+  .node.dimmed { opacity: 0.12; }
+  .node.highlighted circle { stroke-width: 3px; }
+
+  .link { stroke-opacity: 0.35; fill: none; }
+  .link.highlighted { stroke-opacity: 0.9; stroke-width: 2px; }
+  .link.dimmed { stroke-opacity: 0.04; }
+
+  .node-label { font-size: 9px; fill: #8b949e; pointer-events: none; }
+  .node-label.visible { fill: #c9d1d9; }
+
+  /* ── View Consequence panel ─────────────────────────────── */
+  #consequence-panel { padding: 12px 16px; border-top: 1px solid #30363d; flex-shrink: 0; }
+  #consequence-panel .panel-label { font-size: 10px; color: #8b949e; display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.06em; }
+  #consequence-panel .panel-label span { color:#3fb950; font-size:9px; font-style:italic; text-transform:none; letter-spacing:0; }
+  #consequence-query { width:100%; padding:7px 10px; background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; font-size:11px; resize:none; outline:none; font-family:inherit; line-height:1.5; }
+  #consequence-query:focus { border-color:#3fb950; }
+  #btn-consequence { width:100%; margin-top:6px; padding:8px; background:#238636; border:none; border-radius:6px; color:white; font-size:11px; cursor:pointer; font-family:inherit; font-weight:600; letter-spacing:0.03em; }
+  #btn-consequence:hover { background:#2ea043; }
+  #btn-consequence:disabled { background:#1a3020; color:#3d6b45; cursor:not-allowed; }
+
+  /* ── Consequence result tiers ───────────────────────────── */
+  .tier-section { margin-top:14px; }
+  .tier-header { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .tier-badge { font-size:9px; font-weight:700; padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.08em; }
+  .tier-will  { background:#3b0f0f; color:#f85149; }
+  .tier-likely{ background:#2d1f03; color:#e3b341; }
+  .tier-aware { background:#131d2e; color:#8b949e; }
+  .tier-count { font-size:10px; color:#6e7681; }
+
+  .cq-node { padding:9px 11px; margin-bottom:6px; border-radius:6px; background:#0d1117; border:1px solid #21262d; cursor:pointer; transition: border-color 0.15s; }
+  .cq-node:hover { border-color:#30363d; }
+  .cq-node.tier-1 { border-left:3px solid #f85149; }
+  .cq-node.tier-2 { border-left:3px solid #e3b341; }
+  .cq-node.tier-3 { border-left:3px solid #30363d; }
+  .cq-node .cq-name { font-size:12px; font-weight:600; color:#e6edf3; display:flex; align-items:center; gap:6px; }
+  .cq-node .cq-meta { font-size:10px; color:#6e7681; margin-top:2px; }
+  .cq-node .cq-consequence { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; padding-top:6px; border-top:1px solid #21262d; }
+  .cq-edge-badge { font-size:9px; padding:1px 5px; background:#21262d; border-radius:3px; color:#8b949e; font-weight:400; }
+
+  /* ── Lead card ──────────────────────────────────────────── */
+  .lead-card { background:#0d1117; border:1px solid #30363d; border-radius:7px; padding:12px 14px; margin-bottom:14px; }
+  .lead-card .lead-type { font-size:9px; color:#8b949e; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:6px; }
+  .lead-card .lead-summary { font-size:12px; color:#c9d1d9; line-height:1.65; }
+  .lead-card .lead-rec { font-size:12px; color:#3fb950; line-height:1.6; margin-top:6px; font-weight:600; }
+
+  .step-list { margin-top:8px; }
+  .step-row { display:flex; gap:10px; padding:7px 0; border-bottom:1px solid #21262d; cursor:pointer; }
+  .step-row:last-child { border-bottom:none; }
+  .step-num { font-size:11px; color:#58a6ff; font-weight:700; min-width:18px; }
+  .step-name { font-size:11px; color:#e6edf3; font-weight:600; }
+  .step-action { font-size:10px; color:#8b949e; margin-top:2px; line-height:1.4; }
+
+  .option-row { display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #21262d; }
+  .option-row:last-child { border-bottom:none; }
+  .option-name { font-size:11px; color:#e6edf3; }
+  .option-cost { font-size:10px; color:#8b949e; }
+  .option-cost.cheaper { color:#3fb950; }
+
+  /* ── Arity warning panel ────────────────────────────────── */
+  .arity-panel { margin-top:14px; }
+  .arity-banner { display:flex; align-items:center; gap:8px; padding:9px 12px; background:#1a0a0a; border:1px solid #f8514966; border-radius:6px; margin-bottom:8px; }
+  .arity-icon { font-size:14px; }
+  .arity-label { font-size:11px; color:#f85149; font-weight:700; }
+  .arity-sublabel { font-size:10px; color:#8b949e; margin-top:1px; }
+  .arity-card { padding:9px 12px; background:#0d1117; border:1px solid #f8514933; border-left:3px solid #f85149; border-radius:6px; margin-bottom:6px; cursor:pointer; }
+  .arity-card .arity-node { font-size:12px; font-weight:600; color:#f85149; }
+  .arity-card .arity-loc  { font-size:10px; color:#6e7681; margin-top:1px; }
+  .arity-card .arity-msg  { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; }
 </style>
 </head>
 <body>
@@ -1475,6 +1930,31 @@ function renderConsequenceSidebar(data) {
     html += `</div>`;
   }
 
+  // ── Arity mismatch warnings — rendered before tier nodes ──
+  if (data.arity_warnings && data.arity_warnings.length) {
+    html += `<div class="arity-panel">
+      <div class="arity-banner">
+        <span class="arity-icon">⚠</span>
+        <div>
+          <div class="arity-label">Tuple arity mismatch${data.arity_warnings.length > 1 ? 'es' : ''} detected</div>
+          <div class="arity-sublabel">These nodes will raise ValueError at runtime — arity inferred from AST</div>
+        </div>
+      </div>`;
+    data.arity_warnings.forEach(w => {
+      const fname = (w.file || '').split(/[/\\]/).pop();
+      const loc = fname ? `${_h(fname)}${w.line ? ':' + _h(w.line) : ''}` : '';
+      // Apply _h FIRST then substitute backtick→<code> so injected content can't escape
+      const msg = _h(w.message || '').replace(/`([^`]+)`/g,
+        '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#f85149;font-size:10px">$1</code>');
+      html += `<div class="arity-card" onclick="selectNodeById('${_h(w.node)}')">
+        <div class="arity-node">${_h(w.name)}</div>
+        <div class="arity-loc">${loc} · expects ${_h(w.consumer_arity)}-tuple, will receive ${_h(w.source_arity)}-tuple</div>
+        <div class="arity-msg">${msg}</div>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
   // ── Tier 1: will break ──────────────────────────────────────
   if (data.will_break && data.will_break.length) {
     html += `<div class="tier-section">
@@ -1517,7 +1997,7 @@ function renderCqNode(n, tier) {
   const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
   const edges  = (n.edge_types || []).slice(0, 2).map(_h).join(', ');
   const via    = (n.via || []).map(_h).join(', ');
-  // Apply _h FIRST then substitute backtick→<code> so injected backtick content can't escape
+  // Apply _h FIRST then backtick→<code> so injected backtick content can't escape
   const consequence = _h(n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
