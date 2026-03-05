@@ -25,7 +25,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -36,24 +36,13 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PRODUCTION = os.environ.get("CONSEQUENCEGRAPH_ENV") == "production"
-RATE_LIMIT_WINDOW = 60        # seconds
-RATE_LIMIT_MAX    = 60        # requests per window per IP
-RATE_BUCKETS_MAX  = 10_000   # max unique IPs tracked (H2: prevent memory leak)
-CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")  # H3: set in render.yaml for production
+RATE_LIMIT_WINDOW = 60   # seconds
+RATE_LIMIT_MAX    = 60   # requests per window per IP
 
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 
 _rate_buckets: dict = defaultdict(list)
-
-
-def _get_real_ip(request) -> str:
-    """Return real client IP, honouring X-Forwarded-For from proxy/LB (H2)."""
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
@@ -62,10 +51,6 @@ def check_rate_limit(ip: str) -> bool:
     if len(_rate_buckets[ip]) >= RATE_LIMIT_MAX:
         return False
     _rate_buckets[ip].append(now)
-    # H2: cap memory — evict oldest IP bucket when map exceeds limit
-    if len(_rate_buckets) > RATE_BUCKETS_MAX:
-        oldest = next(iter(_rate_buckets))
-        del _rate_buckets[oldest]
     return True
 
 
@@ -87,12 +72,7 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
-    if not os.path.isdir(_index_path):  # C1: reject non-existent / non-directory paths
-        raise RuntimeError(f"Index path does not exist or is not a directory: {_index_path}")
-    # If a cache.json lives directly inside --path (pre-built deployment), use it.
-    # Otherwise fall back to the live-index dev cache at .consequencegraph/cache.json.
-    _path_cache = os.path.join(_index_path, "cache.json")
-    cache = _path_cache if os.path.isfile(_path_cache) else os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
+    cache = os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
 
     _graph = KnowledgeGraph()
     _graph.CACHE_FILE = cache
@@ -116,13 +96,13 @@ def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = Fal
 
 app = FastAPI(title="consequencegraph", description="Consequence-aware code knowledge graph")
 
-app.add_middleware(CORSMiddleware, allow_origins=[CORS_ORIGIN], allow_methods=["GET", "POST"])  # H3
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"])
 
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if PRODUCTION and request.url.path.startswith("/api/"):
-        ip = _get_real_ip(request)  # H2: use real IP behind proxy
+        ip = request.client.host if request.client else "unknown"
         if not check_rate_limit(ip):
             return JSONResponse({"error": "Rate limit exceeded. Try again in a minute."}, status_code=429)
     return await call_next(request)
@@ -163,7 +143,7 @@ def api_graph():
 
 
 @app.get("/api/impact/{node_id:path}")
-def api_impact(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2: cap traversal depth
+def api_impact(node_id: str, depth: int = None):
     """Return impact report for a node."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -171,7 +151,7 @@ def api_impact(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2: cap t
 
 
 @app.get("/api/impact_text/{node_id:path}")
-def api_impact_text(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2
+def api_impact_text(node_id: str, depth: int = None):
     """Return human-readable impact report."""
     engine = get_engine()
     result = engine.impact(node_id, depth=depth)
@@ -179,7 +159,7 @@ def api_impact_text(node_id: str, depth: int = Query(None, ge=1, le=6)):  # L2
 
 
 @app.get("/api/search")
-def api_search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(20, ge=1, le=100)):  # H4
+def api_search(q: str, limit: int = 20):
     """Search nodes by name."""
     g = get_graph()
     results = []
@@ -210,38 +190,486 @@ def api_reindex():
     return {"status": "ok", "nodes": get_graph().node_count(), "edges": get_graph().edge_count()}
 
 
-@app.get("/api/simulate")
-def api_simulate(node_id: str, change: str = Query(..., max_length=500), depth: int = Query(None, ge=1, le=6)):  # H4 + L2
+@app.post("/api/consequence")
+async def api_consequence(request: Request):
     """
-    Given a node and a plain-English change description, classify the change
-    type and return an annotated impact report explaining what specifically
-    breaks at each downstream node.
+    Unified consequence analysis. Accepts a free-form query + optional anchor node.
+    Classifies intent, routes to the right analysis strategy, returns adaptive output:
+      - specific_change   → step-by-step plan in dependency order
+      - decision          → A vs B comparison with change counts
+      - removal           → ordered cleanup plan
+      - exploration       → structural paragraph + intersection breakdown
     """
+    body = await request.json()
+    query_text = body.get("query", "").strip()
+    anchor_id  = body.get("anchor_node_id")       # set when user clicked a node first
+
+    if not query_text:
+        raise HTTPException(status_code=400, detail="query field required")
+
+    graph  = get_graph()
     engine = get_engine()
-    graph = get_graph()
 
-    # 1. Classify the change
-    change_type, change_meta = _classify_change(change, node_id, graph)
+    # 1. Extract mentioned nodes — anchor always included and weighted higher
+    mentioned = _cq_extract_nodes(query_text, graph)
+    if anchor_id and anchor_id not in mentioned:
+        mentioned.insert(0, anchor_id)
+    if not mentioned:
+        return {
+            "error": "No known nodes found in query.",
+            "hint": "Mention function or class names from the codebase, e.g. 'WeatherDataset.__getitem__' or 'training_step'.",
+        }
 
-    # 2. Get blast radius
-    result = engine.impact(node_id, depth=depth)
-    if "error" in result or "ambiguous" in result:
-        return result
+    # 2. Classify intent
+    intent     = _cq_classify_intent(query_text)
+    change_type = _cq_classify_change_type(query_text)
 
-    # 3. Annotate each downstream node with what specifically breaks
-    for entry in result.get("blast_radius", {}).get("downstream", []):
-        node_data = graph.get_node(entry["node"]) or {}
-        entry["consequence"] = _annotate_consequence(
-            change_type, change_meta, entry, node_data
+    # 3. Compute blast radius per mentioned node
+    impacts = {}
+    for nid in mentioned:
+        r = engine.impact(nid, depth=3)
+        if "error" not in r and "ambiguous" not in r:
+            impacts[nid] = r
+
+    if not impacts:
+        return {"error": "Could not compute impact for any mentioned nodes.", "mentioned": mentioned}
+
+    # 4. Score all nodes by structural relevance
+    intersection_scores: dict = {}
+    edge_types_by_node:  dict = {}
+    reasons_by_node:     dict = {}
+    depth_by_node:       dict = {}
+
+    for origin_id, impact in impacts.items():
+        for direction in ("downstream", "upstream"):
+            for entry in impact.get("blast_radius", {}).get(direction, []):
+                nid = entry["node"]
+                if any(nid.startswith(p) for p in ("hook::", "config::", "tensor_contract::")):
+                    continue
+                if nid in mentioned:
+                    continue
+                intersection_scores[nid] = intersection_scores.get(nid, 0) + 1
+                edge_types_by_node.setdefault(nid, set()).add(entry.get("edge_type", ""))
+                depth_by_node[nid] = min(depth_by_node.get(nid, 99), entry.get("depth", 99))
+                reasons_by_node.setdefault(nid, []).append({
+                    "origin":    origin_id,
+                    "edge_type": entry.get("edge_type", ""),
+                    "reason":    entry.get("reason", ""),
+                    "depth":     entry.get("depth", 1),
+                    "direction": direction,
+                })
+
+    # 5. Tier classification
+    HIGH_RISK = {"produces_tensor_for", "overrides_hook", "inherits"}
+    MED_RISK  = {"consumes_format", "reads_config", "calls"}
+
+    will_break  = []  # tier 1 — non-negotiable
+    likely_need = []  # tier 2 — high probability
+    be_aware    = []  # tier 3 — in blast radius, probably safe
+
+    for nid, score in sorted(intersection_scores.items(), key=lambda x: -x[1]):
+        node_data  = graph.get_node(nid) or {}
+        edges      = edge_types_by_node.get(nid, set())
+        depth      = depth_by_node.get(nid, 3)
+        reasons    = reasons_by_node.get(nid, [])
+
+        # Compute tier score
+        tier_score = score * 2
+        if edges & HIGH_RISK:      tier_score += 3
+        if edges & MED_RISK:       tier_score += 1
+        if depth == 1:             tier_score += 2
+        if node_data.get("is_lightning_hook"):    tier_score += 2
+        if node_data.get("tensor_shapes"):        tier_score += 1
+        if nid == anchor_id:                      tier_score += 3
+
+        consequence = _cq_consequence_sentence(
+            intent, change_type, nid, node_data, edges, reasons, depth
         )
 
-    result["change_type"] = change_type
-    result["change_description"] = change
-    result["change_meta"] = change_meta
-    return result
+        entry = {
+            "node":       nid,
+            "name":       node_data.get("name", nid.split(".")[-1]),
+            "type":       node_data.get("node_type", ""),
+            "file":       node_data.get("file_path", ""),
+            "line":       node_data.get("line_no", 0),
+            "is_hook":    node_data.get("is_lightning_hook", False),
+            "shapes":     node_data.get("tensor_shapes", {}),
+            "edge_types": list(edges),
+            "depth":      depth,
+            "tier_score": tier_score,
+            "intersection_count": score,
+            "via":        list({r["origin"].split(".")[-1] for r in reasons})[:3],
+            "consequence": consequence,
+        }
+
+        if tier_score >= 6:
+            will_break.append(entry)
+        elif tier_score >= 3:
+            likely_need.append(entry)
+        else:
+            be_aware.append(entry)
+
+    # Hard caps per tier
+    will_break  = sorted(will_break,  key=lambda x: -x["tier_score"])[:5]
+    likely_need = sorted(likely_need, key=lambda x: -x["tier_score"])[:4]
+    be_aware    = sorted(be_aware,    key=lambda x: -x["tier_score"])[:3]
+
+    # 6. Build adaptive lead
+    lead = _cq_build_lead(
+        intent, change_type, query_text, mentioned, impacts,
+        will_break, likely_need, graph
+    )
+
+    # 7. Highlighted node IDs for graph
+    highlighted = set(mentioned) | {n["node"] for n in will_break + likely_need + be_aware}
+
+    return {
+        "intent":        intent,
+        "change_type":   change_type,
+        "query":         query_text,
+        "anchor":        anchor_id,
+        "mentioned":     mentioned,
+        "mentioned_details": [
+            {
+                "node": nid,
+                "name": (graph.get_node(nid) or {}).get("name", nid.split(".")[-1]),
+                "file": (graph.get_node(nid) or {}).get("file_path", ""),
+                "line": (graph.get_node(nid) or {}).get("line_no", 0),
+                "severity": impacts.get(nid, {}).get("severity", ""),
+            }
+            for nid in mentioned
+        ],
+        "lead":          lead,
+        "will_break":    will_break,
+        "likely_need":   likely_need,
+        "be_aware":      be_aware,
+        "highlighted":   list(highlighted),
+    }
 
 
-def _classify_change(description: str, node_id: str, graph: KnowledgeGraph) -> tuple[str, dict]:
+# ── Consequence helpers ───────────────────────────────────────────────────────
+
+def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list:
+    found, seen = [], set()
+    candidates = []
+    for nid, data in graph.g.nodes(data=True):
+        name = data.get("name", "")
+        if name and len(name) > 3:
+            candidates.append((nid, name))
+        parts = nid.split(".")
+        if len(parts) >= 2:
+            candidates.append((nid, parts[-2]))
+            candidates.append((nid, parts[-1]))
+    deduped = list({(n, nm): None for n, nm in candidates}.keys())
+    deduped.sort(key=lambda x: -len(x[1]))
+    for nid, name in deduped:
+        if nid in seen:
+            continue
+        if re.search(r'\b' + re.escape(name) + r'\b', query, re.IGNORECASE):
+            found.append(nid)
+            seen.add(nid)
+    return found[:10]
+
+
+def _cq_classify_intent(query: str) -> str:
+    q = query.lower()
+    # Decision: two approaches being weighed
+    if any(p in q for p in ["either", "or", "vs", "versus", "approach", "should i", "which"]):
+        return "decision"
+    # Removal
+    if any(w in q for w in ["remove", "delete", "deprecate", "drop"]):
+        return "removal"
+    # Specific targeted change
+    if any(w in q for w in ["add", "rename", "change", "modify", "replace", "refactor",
+                              "implement", "introduce"]):
+        return "specific_change"
+    return "exploration"
+
+
+def _cq_classify_change_type(query: str) -> str:
+    q = query.lower()
+    if any(w in q for w in ["return", "tuple", "output", "yield", "add tensor", "new tensor"]):
+        return "return_format_change"
+    if any(w in q for w in ["rename", "move"]):
+        return "rename"
+    if any(w in q for w in ["param", "argument", "signature", "kwarg"]):
+        return "signature_change"
+    if any(w in q for w in ["dim", "shape", "hidden", "channels", "d_h", "d_model"]):
+        return "dimension_change"
+    if any(w in q for w in ["buffer", "tensor", "weight", "mask", "register"]):
+        return "add_tensor_component"
+    if any(w in q for w in ["config", "hparam", "yaml", "setting"]):
+        return "config_change"
+    if any(w in q for w in ["remove", "delete", "deprecate"]):
+        return "removal"
+    return "modification"
+
+
+def _cq_consequence_sentence(
+    intent: str, change_type: str, node_id: str,
+    node_data: dict, edges: set, reasons: list, depth: int
+) -> str:
+    name    = node_data.get("name", node_id.split(".")[-1])
+    is_hook = node_data.get("is_lightning_hook", False)
+    shapes  = node_data.get("tensor_shapes", {})
+    n_origins = len({r["origin"] for r in reasons})
+    file    = node_data.get("file_path", "")
+    fname   = file.split("\\")[-1].split("/")[-1] if file else ""
+    loc     = f" ({fname}:{node_data.get('line_no','')})" if fname else ""
+
+    # Shape hint for the sentence
+    shape_hint = ""
+    if shapes:
+        k, v = next(iter(shapes.items()))
+        sv = v.get("shape", v) if isinstance(v, dict) else v
+        shape_hint = f" — current contract: `{k}: {sv}`"
+
+    if change_type == "return_format_change":
+        if "consumes_format" in edges:
+            return f"`{name}`{loc} unpacks this return value directly. Adding a tensor shifts the tuple — destructuring breaks here."
+        if "produces_tensor_for" in edges:
+            return f"`{name}`{loc} has an explicit tensor shape contract{shape_hint}. The contract must be updated to reflect the new output."
+        if is_hook:
+            return f"Lightning hook `{name}`{loc} receives this as its batch input — a format change causes a runtime mismatch at the framework boundary."
+
+    if change_type == "add_tensor_component":
+        if "__init__" in node_id:
+            return f"`{name}`{loc} is where `register_buffer(...)` must be called — buffers registered here persist across devices, checkpoints, and `.to()` calls."
+        if "consumes_format" in edges or "produces_tensor_for" in edges:
+            return f"`{name}`{loc} sits in the tensor data flow{shape_hint}. The new weight tensor must be threaded through here explicitly."
+        if is_hook:
+            return f"Lightning hook `{name}`{loc} — this is where the buffer gets applied to the loss. It must be in scope here."
+
+    if change_type == "signature_change":
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this directly at depth {depth} — all argument lists at this call site need updating."
+        if "inherits" in edges:
+            return f"`{name}`{loc} inherits this method — the override signature must remain compatible or the MRO breaks."
+        if "overrides_hook" in edges:
+            return f"`{name}`{loc} implements a Lightning hook — the framework enforces the signature contract, changing it breaks training."
+
+    if change_type == "rename":
+        if "named_reference" in edges:
+            return f"`{name}`{loc} references this name in a docstring or string literal — won't break at runtime but becomes stale documentation."
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this by name — call sites break immediately on rename."
+        if "imports" in edges:
+            return f"`{name}`{loc} imports this symbol — the import path breaks on rename."
+
+    if change_type == "removal":
+        if "inherits" in edges:
+            return f"`{name}`{loc} inherits from this class — removing it collapses the entire class hierarchy at this point."
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this directly — removal raises `AttributeError` here at runtime."
+        return f"`{name}`{loc} depends on this existing — removal causes `NameError` or `ImportError` at this file."
+
+    if change_type == "dimension_change":
+        if shapes:
+            return f"`{name}`{loc} has shape contract{shape_hint} — the dimension change propagates into this contract."
+        if "produces_tensor_for" in edges or "consumes_format" in edges:
+            return f"`{name}`{loc} is in the tensor flow path — a dimension change cascades here via shape-dependent operations."
+
+    if change_type == "config_change":
+        if "reads_config" in edges:
+            return f"`{name}`{loc} reads this config key — a rename or removal breaks the lookup silently (returns None, not an exception)."
+
+    # Generic — but still specific about intersection
+    if n_origins > 1:
+        origins_str = ", ".join(list({r["origin"].split(".")[-1] for r in reasons})[:3])
+        return f"`{name}`{loc} appears in the blast radius of {n_origins} affected nodes ({origins_str}) — structurally central to this change."
+    edge_desc = next(iter(edges), "dependency")
+    origin = reasons[0]["origin"].split(".")[-1] if reasons else "a mentioned node"
+    return f"`{name}`{loc} is connected via `{edge_desc}` from `{origin}` at depth {depth}."
+
+
+def _cq_build_lead(
+    intent: str, change_type: str, query: str,
+    mentioned: list, impacts: dict,
+    will_break: list, likely_need: list,
+    graph: KnowledgeGraph
+) -> dict:
+    """Build the adaptive lead section depending on query intent."""
+    total_structural = len(will_break) + len(likely_need)
+
+    if intent == "decision":
+        # Find candidate location nodes — the "or" options
+        # Try to detect A vs B from mentioned nodes
+        names = [(graph.get_node(n) or {}).get("name", n.split(".")[-1]) for n in mentioned]
+        # Score each mentioned node as an "option" by its own blast radius size
+        options = []
+        for nid in mentioned:
+            impact = impacts.get(nid, {})
+            br = impact.get("blast_radius", {})
+            downstream = [
+                e for e in br.get("downstream", [])
+                if not e["node"].startswith(("hook::", "config::", "tensor_contract::"))
+            ]
+            options.append({
+                "node":  nid,
+                "name":  (graph.get_node(nid) or {}).get("name", nid.split(".")[-1]),
+                "downstream_count": len(downstream),
+                "severity": impact.get("severity", "low"),
+            })
+        options.sort(key=lambda x: x["downstream_count"])
+
+        if len(options) >= 2:
+            a, b = options[0], options[-1]
+            diff = b["downstream_count"] - a["downstream_count"]
+            recommendation = (
+                f"`{a['name']}` is the structurally cheaper option — "
+                f"{a['downstream_count']} downstream nodes affected vs "
+                f"{b['downstream_count']} for `{b['name']}` "
+                f"({diff} fewer cascading changes)."
+            )
+        else:
+            recommendation = f"Analysis touches {len(mentioned)} candidate locations. See tier breakdown for structural cost."
+
+        return {
+            "format":         "decision",
+            "recommendation": recommendation,
+            "options":        options,
+            "total_changes":  total_structural,
+        }
+
+    if intent == "removal":
+        # Build a dependency-ordered cleanup plan
+        # Sort will_break by depth — shallowest first (fix dependents before removing)
+        ordered = sorted(will_break + likely_need, key=lambda x: x["depth"])
+        steps = []
+        for i, node in enumerate(ordered[:6], 1):
+            steps.append({
+                "step": i,
+                "node": node["node"],
+                "name": node["name"],
+                "action": node["consequence"],
+            })
+
+        anchor_names = [(graph.get_node(n) or {}).get("name", n.split(".")[-1]) for n in mentioned[:2]]
+        return {
+            "format":  "removal_plan",
+            "summary": (
+                f"Removing `{'` / `'.join(anchor_names)}` requires cleaning up "
+                f"{total_structural} dependent locations first. "
+                f"Work from the outermost callers inward — removing the source before "
+                f"clearing its consumers causes cascading runtime errors."
+            ),
+            "ordered_steps": steps,
+        }
+
+    if intent == "specific_change":
+        # Step-by-step plan ordered by depth (shallowest = closest to source = change first)
+        all_nodes = will_break + likely_need
+        # Sort: direct dependents (depth 1) last — they break because of their dependency,
+        # so fix the source first, then update consumers in order
+        ordered = sorted(all_nodes, key=lambda x: x["depth"])
+        steps = []
+        anchor_name = (graph.get_node(mentioned[0]) or {}).get("name", mentioned[0].split(".")[-1]) if mentioned else "target"
+        steps.append({
+            "step": 1,
+            "node": mentioned[0] if mentioned else "",
+            "name": anchor_name,
+            "action": f"Make the change here — this is the source node your query describes.",
+        })
+        for i, node in enumerate(ordered[:5], 2):
+            steps.append({
+                "step": i,
+                "node": node["node"],
+                "name": node["name"],
+                "action": node["consequence"],
+            })
+
+        change_label = {
+            "return_format_change": "return format change",
+            "signature_change": "signature change",
+            "rename": "rename",
+            "dimension_change": "dimension change",
+            "add_tensor_component": "new tensor component",
+            "removal": "removal",
+        }.get(change_type, "change")
+
+        return {
+            "format":  "step_by_step",
+            "summary": (
+                f"This {change_label} has {len(will_break)} nodes that will break "
+                f"and {len(likely_need)} that likely need updating. "
+                f"Follow the plan below in order — each step depends on the previous."
+            ),
+            "steps": steps,
+        }
+
+    # exploration / general — structural paragraph
+    mentioned_names = [(graph.get_node(n) or {}).get("name", n.split(".")[-1]) for n in mentioned[:4]]
+    top_node = will_break[0] if will_break else (likely_need[0] if likely_need else None)
+    structural_insight = ""
+    if top_node:
+        structural_insight = (
+            f" The most structurally central node not in your query is "
+            f"`{top_node['name']}` — it sits in {top_node['intersection_count']} "
+            f"blast radii and will need attention."
+        )
+
+    return {
+        "format":  "exploration",
+        "summary": (
+            f"Your query touches {len(mentioned)} known nodes "
+            f"({', '.join(f'`{n}`' for n in mentioned_names)})."
+            f"{structural_insight} "
+            f"{total_structural} additional nodes are structurally relevant to this idea."
+        ),
+    }
+
+
+@app.get("/api/node_context/{node_id:path}")
+def api_node_context(node_id: str):
+    """Return pre-population context for a node — shown in textarea when user clicks."""
+    graph  = get_graph()
+    engine = get_engine()
+    data   = graph.get_node(node_id)
+    if not data:
+        return {"error": "Node not found"}
+
+    name     = data.get("name", node_id.split(".")[-1])
+    ntype    = data.get("node_type", "")
+    file     = data.get("file_path", "")
+    fname    = file.split("\\")[-1].split("/")[-1] if file else ""
+    line     = data.get("line_no", 0)
+    sig      = data.get("signature", "")
+    doc      = data.get("docstring", "")
+    shapes   = data.get("tensor_shapes", {})
+    is_hook  = data.get("is_lightning_hook", False)
+
+    impact   = engine.impact(node_id, depth=2)
+    sev      = impact.get("severity", "")
+    downstream = impact.get("blast_radius", {}).get("downstream_count", 0)
+    upstream   = impact.get("blast_radius", {}).get("upstream_count", 0)
+
+    # Build context string
+    lines = [f"Node: {name}  ({ntype} · {fname}:{line})"]
+    if sig:
+        lines.append(f"Signature: {name}{sig}")
+    if is_hook:
+        lines.append("Role: PyTorch Lightning lifecycle hook")
+    if sev:
+        lines.append(f"Impact: {sev.upper()} — {downstream} downstream, {upstream} upstream")
+    if shapes:
+        shape_parts = [f"{k}: {v.get('shape', v) if isinstance(v, dict) else v}" for k, v in list(shapes.items())[:3]]
+        lines.append("Tensor contracts: " + ", ".join(shape_parts))
+    if doc:
+        lines.append(f'Docstring: "{doc[:120]}{"..." if len(doc) > 120 else ""}"')
+
+    lines.append("")
+    lines.append("Describe your idea or change:")
+
+    return {
+        "node_id":  node_id,
+        "name":     name,
+        "context_text": "\n".join(lines),
+        "severity": sev,
+        "downstream_count": downstream,
+    }
+
+
+
     """
     Classify a plain-English change description into a structured change type.
     Returns (change_type, metadata_dict).
@@ -296,313 +724,19 @@ def _classify_change(description: str, node_id: str, graph: KnowledgeGraph) -> t
     return "modification", {"description": description}
 
 
-def _annotate_consequence(
-    change_type: str,
-    change_meta: dict,
-    blast_entry: dict,
-    node_data: dict,
-) -> str:
-    """
-    Given a change type and a downstream node, return a specific consequence string
-    explaining what will break and why.
-    """
-    edge_type = blast_entry.get("edge_type", "")
-    node_name = blast_entry.get("name") or blast_entry.get("node", "").split(".")[-1]
-    is_hook = node_data.get("is_lightning_hook", False)
-    shapes = node_data.get("tensor_shapes", {})
-
-    if change_type == "return_format_change":
-        if edge_type == "consumes_format":
-            return f"`{node_name}` unpacks this return value — tuple destructuring will fail if arity or key names change."
-        if edge_type == "produces_tensor_for":
-            return f"Tensor contract at `{node_name}` will be violated — shape annotations need updating."
-        if is_hook:
-            return f"Lightning hook `{node_name}` receives the batch from this function — format mismatch will cause runtime error."
-
-    elif change_type == "signature_change":
-        if edge_type == "calls":
-            return f"`{node_name}` calls this function directly — all call sites need updated argument lists."
-        if edge_type == "overrides_hook":
-            return f"Lightning requires a specific signature for this hook — changing it breaks the framework contract."
-        if edge_type == "inherits":
-            return f"Subclass `{node_name}` inherits this method — override signature must stay compatible."
-
-    elif change_type == "dimension_change":
-        if shapes:
-            shape_str = ", ".join(f"{k}: {v.get('shape', v) if isinstance(v, dict) else v}" for k, v in list(shapes.items())[:2])
-            return f"`{node_name}` has shape contract [{shape_str}] — dimension change will propagate here."
-        if edge_type in ("produces_tensor_for", "consumes_format"):
-            return f"`{node_name}` is in the tensor flow path — hidden dimension change cascades here."
-        return f"`{node_name}` depends on this dimension — weight matrices or layer definitions may be mismatched."
-
-    elif change_type == "rename":
-        if edge_type == "named_reference":
-            return f"`{node_name}` references this name in a docstring or comment — update needed."
-        if edge_type == "calls":
-            return f"`{node_name}` calls this by name — call sites will break."
-        if edge_type == "imports":
-            return f"`{node_name}` imports this symbol — import statement needs updating."
-
-    elif change_type == "removal":
-        if edge_type == "inherits":
-            return f"`{node_name}` inherits from this — removal breaks the class hierarchy entirely."
-        if edge_type == "calls":
-            return f"`{node_name}` calls this function — will raise AttributeError or NameError at runtime."
-        return f"`{node_name}` depends on this existing — removal causes NameError or ImportError."
-
-    elif change_type == "config_change":
-        if edge_type == "reads_config":
-            return f"`{node_name}` reads this config key — key rename or removal breaks this lookup."
-
-    elif change_type == "data_format_change":
-        if edge_type == "consumes_format":
-            return f"`{node_name}` consumes this data format — field rename or schema change breaks unpacking here."
-        if is_hook:
-            return f"Lightning hook `{node_name}` receives data from this pipeline — format change causes runtime failure."
-
-    # Generic fallback
-    return f"`{node_name}` is in the blast radius via `{edge_type}` — verify compatibility after this change."
-
-
-@app.post("/api/reason")
-async def api_reason(request: Request):
-    """
-    Multi-node intersection analysis for architectural/design queries.
-    Extracts all mentioned nodes, computes combined blast radii,
-    returns only structurally relevant intersection nodes ranked by relevance.
-    """
-    body = await request.json()
-    query_text = body.get("query", "").strip()
-    if not query_text:
-        raise HTTPException(status_code=400, detail="query field required")
-    if len(query_text) > 1000:  # H4: prevent O(n × |query|) regex DoS
-        raise HTTPException(status_code=400, detail="query too long (max 1000 characters)")
-
-    graph = get_graph()
-    engine = get_engine()
-
-    mentioned_nodes = _extract_mentioned_nodes(query_text, graph)
-    if not mentioned_nodes:
-        return {
-            "error": "No known nodes found in query.",
-            "hint": "Try mentioning function or class names from the codebase directly.",
-            "query": query_text,
-        }
-
-    query_intent = _classify_query_intent(query_text)
-
-    all_radii: dict = {}
-    node_impacts: dict = {}
-    for node_id in mentioned_nodes:
-        result = engine.impact(node_id, depth=3)
-        if "error" in result or "ambiguous" in result:
-            continue
-        node_impacts[node_id] = result
-        downstream_ids = {e["node"] for e in result.get("blast_radius", {}).get("downstream", [])}
-        upstream_ids = {e["node"] for e in result.get("blast_radius", {}).get("upstream", [])}
-        all_radii[node_id] = downstream_ids | upstream_ids
-
-    if not all_radii:
-        return {"error": "Could not compute impact for any mentioned nodes.", "mentioned": mentioned_nodes}
-
-    intersection_scores: dict = {}
-    edge_types_by_node: dict = {}
-    reasons_by_node: dict = {}
-
-    for origin_id, radius in all_radii.items():
-        impact = node_impacts.get(origin_id, {})
-        all_entries = (
-            impact.get("blast_radius", {}).get("downstream", []) +
-            impact.get("blast_radius", {}).get("upstream", [])
-        )
-        for entry in all_entries:
-            nid = entry["node"]
-            if any(nid.startswith(p) for p in ("hook::", "config::", "tensor_contract::")):
-                continue
-            intersection_scores[nid] = intersection_scores.get(nid, 0) + 1
-            edge_types_by_node.setdefault(nid, set()).add(entry.get("edge_type", ""))
-            reasons_by_node.setdefault(nid, []).append({
-                "origin": origin_id,
-                "edge_type": entry.get("edge_type", ""),
-                "reason": entry.get("reason", ""),
-                "depth": entry.get("depth", 1),
-            })
-
-    relevant_edge_types = _relevant_edge_types_for_intent(query_intent)
-    ranked = []
-    for nid, score in sorted(intersection_scores.items(), key=lambda x: -x[1]):
-        if nid in mentioned_nodes:
-            continue
-        node_data = graph.get_node(nid) or {}
-        edges = edge_types_by_node.get(nid, set())
-        relevance = score
-        if edges & relevant_edge_types:
-            relevance += 2
-        if node_data.get("is_lightning_hook"):
-            relevance += 1
-        if node_data.get("tensor_shapes"):
-            relevance += 1
-
-        annotation = _reason_consequence(
-            query_intent, query_text, nid, node_data, reasons_by_node.get(nid, [])
-        )
-        ranked.append({
-            "node": nid,
-            "name": node_data.get("name", nid.split(".")[-1]),
-            "type": node_data.get("node_type", ""),
-            "file": node_data.get("file_path", ""),
-            "line": node_data.get("line_no", 0),
-            "is_lightning_hook": node_data.get("is_lightning_hook", False),
-            "tensor_shapes": node_data.get("tensor_shapes", {}),
-            "intersection_count": score,
-            "relevance": relevance,
-            "edge_types": list(edges),
-            "origins": list({r["origin"].split(".")[-1] for r in reasons_by_node.get(nid, [])}),
-            "annotation": annotation,
-        })
-
-    ranked.sort(key=lambda x: -x["relevance"])
-    must_change = [n for n in ranked if n["relevance"] >= 3][:8]
-    likely_change = [n for n in ranked if 1 < n["relevance"] < 3][:5]
-
-    return {
-        "query": query_text,
-        "query_intent": query_intent,
-        "mentioned_nodes": mentioned_nodes,
-        "mentioned_node_details": [
-            {
-                "node": nid,
-                "name": (graph.get_node(nid) or {}).get("name", nid.split(".")[-1]),
-                "file": (graph.get_node(nid) or {}).get("file_path", ""),
-                "line": (graph.get_node(nid) or {}).get("line_no", 0),
-            }
-            for nid in mentioned_nodes
-        ],
-        "must_change": must_change,
-        "likely_change": likely_change,
-        "summary": _build_reason_summary(query_intent, mentioned_nodes, must_change, graph),
-    }
-
-
-def _extract_mentioned_nodes(query: str, graph: KnowledgeGraph) -> list:
-    found = []
-    seen = set()
-    candidates = []
-    for nid, data in graph.g.nodes(data=True):
-        name = data.get("name", "")
-        if name and len(name) > 3:
-            candidates.append((nid, name))
-        parts = nid.split(".")
-        if len(parts) >= 2:
-            candidates.append((nid, parts[-2]))
-            candidates.append((nid, parts[-1]))
-    seen_keys = set()
-    unique = []
-    for nid, name in candidates:
-        k = (nid, name)
-        if k not in seen_keys:
-            seen_keys.add(k)
-            unique.append((nid, name))
-    unique.sort(key=lambda x: -len(x[1]))
-    for nid, name in unique:
-        if nid in seen:
-            continue
-        if re.search(r'\b' + re.escape(name) + r'\b', query, re.IGNORECASE):
-            found.append(nid)
-            seen.add(nid)
-    return found[:10]
-
-
-def _classify_query_intent(query: str) -> str:
-    q = query.lower()
-    if any(w in q for w in ["add", "implement", "introduce", "create", "new"]):
-        if any(w in q for w in ["buffer", "tensor", "weight", "mask"]):
-            return "add_tensor_component"
-        return "add_feature"
-    if any(w in q for w in ["move", "refactor", "migrate", "integrate"]):
-        return "refactor_location"
-    if any(w in q for w in ["remove", "delete", "deprecate"]):
-        return "removal"
-    if any(w in q for w in ["where", "should", "better", "approach", "design", "architecture"]):
-        return "design_question"
-    return "general_query"
-
-
-def _relevant_edge_types_for_intent(intent: str) -> set:
-    base = {"calls", "inherits", "instantiates"}
-    if intent in ("add_tensor_component", "add_feature"):
-        return base | {"produces_tensor_for", "consumes_format", "reads_config"}
-    if intent == "refactor_location":
-        return base | {"consumes_format", "imports", "reads_config"}
-    return base | {"produces_tensor_for", "consumes_format", "reads_config", "overrides_hook"}
-
-
-def _reason_consequence(intent: str, query: str, node_id: str, node_data: dict, reasons: list) -> str:
-    name = node_data.get("name", node_id.split(".")[-1])
-    is_hook = node_data.get("is_lightning_hook", False)
-    shapes = node_data.get("tensor_shapes", {})
-    origins = [r["origin"].split(".")[-1] for r in reasons]
-    edge_types = {r["edge_type"] for r in reasons}
-    intersection_count = len({r["origin"] for r in reasons})
-
-    if intent == "add_tensor_component":
-        if "__init__" in node_id:
-            return f"`{name}` — `register_buffer(...)` must be called here to persist the new tensor across devices and checkpoints."
-        if "consumes_format" in edge_types or "produces_tensor_for" in edge_types:
-            return f"`{name}` is in the tensor data flow — the new weight tensor must be threaded through here."
-        if is_hook:
-            return f"Lightning hook `{name}` — the buffer must be accessible at this scope for the weight to apply."
-        if shapes:
-            k, v = next(iter(shapes.items()))
-            sv = v.get("shape", v) if isinstance(v, dict) else v
-            return f"`{name}` has shape contract {k}: {sv} — new tensor must be dimensionally compatible."
-        if intersection_count > 1:
-            return f"`{name}` sits at the intersection of {intersection_count} affected paths ({', '.join(set(origins[:3]))}). Structural crossroads."
-
-    if intent == "design_question":
-        if intersection_count > 1:
-            return f"`{name}` is structurally coupled to {intersection_count} of your candidate locations — affected regardless of design choice."
-        if "consumes_format" in edge_types:
-            return f"`{name}` consumes the data format that will change — must update under either approach."
-
-    if intersection_count > 1:
-        return f"`{name}` appears in {intersection_count} blast radii — central to this change."
-    edge_desc = next(iter(edge_types), "dependency")
-    return f"`{name}` connected via `{edge_desc}` from {origins[0] if origins else 'a mentioned node'}."
-
-
-def _build_reason_summary(intent: str, mentioned_nodes: list, must_change: list, graph: KnowledgeGraph) -> str:
-    n_mentioned = len(mentioned_nodes)
-    n_must = len(must_change)
-    names = [(graph.get_node(n) or {}).get("name", n.split(".")[-1]) for n in mentioned_nodes[:4]]
-    if intent == "add_tensor_component":
-        return (
-            f"Query touches {n_mentioned} nodes ({', '.join(names)}). "
-            f"Adding a tensor component requires changes at {n_must} structural points not explicitly mentioned. "
-            f"Critical path: Datastore init → ARModel.__init__ (register_buffer) → training_step (apply weight). "
-            f"Nodes marked 'must change' sit in the data flow between your proposed source and consumer."
-        )
-    return (
-        f"Query references {n_mentioned} nodes. "
-        f"{n_must} additional nodes are structurally relevant. "
-        f"Ranked by how many mentioned nodes they intersect."
-    )
 
 
 @app.get("/api/diff")
-def api_diff(base: str = Query("main", max_length=100)):  # C2: validate before passing to git
+def api_diff(base: str = "main"):
     """Return impact for all functions changed vs git base branch."""
-    # C2: allowlist — only safe ref characters, reject option-like args
-    if not re.match(r'^[a-zA-Z0-9/_.\.\-]{1,100}$', base) or base.startswith('-'):
-        raise HTTPException(status_code=400, detail="Invalid base ref. Use a valid branch or commit name.")
     try:
         result = subprocess.run(
             ["git", "diff", base, "--name-only"],
             capture_output=True, text=True, cwd=_index_path
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
-    except Exception:
-        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2: don't leak internal error
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Git error: {e}")
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -740,12 +874,53 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .node-label { font-size: 9px; fill: #8b949e; pointer-events: none; }
   .node-label.visible { fill: #c9d1d9; }
 
-  #change-input-panel { padding: 12px 16px; border-top: 1px solid #30363d; }
-  #change-input-panel label { font-size: 10px; color: #8b949e; display: block; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.06em; }
-  #change-desc { width: 100%; padding: 7px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; resize: none; outline: none; font-family: inherit; }
-  #change-desc:focus { border-color: #58a6ff; }
-  #btn-simulate { width: 100%; margin-top: 6px; padding: 7px; background: #1f6feb; border: none; border-radius: 6px; color: white; font-size: 11px; cursor: pointer; font-family: inherit; }
-  #btn-simulate:hover { background: #388bfd; }
+  /* ── View Consequence panel ─────────────────────────────── */
+  #consequence-panel { padding: 12px 16px; border-top: 1px solid #30363d; flex-shrink: 0; }
+  #consequence-panel .panel-label { font-size: 10px; color: #8b949e; display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.06em; }
+  #consequence-panel .panel-label span { color:#3fb950; font-size:9px; font-style:italic; text-transform:none; letter-spacing:0; }
+  #consequence-query { width:100%; padding:7px 10px; background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#e6edf3; font-size:11px; resize:none; outline:none; font-family:inherit; line-height:1.5; }
+  #consequence-query:focus { border-color:#3fb950; }
+  #btn-consequence { width:100%; margin-top:6px; padding:8px; background:#238636; border:none; border-radius:6px; color:white; font-size:11px; cursor:pointer; font-family:inherit; font-weight:600; letter-spacing:0.03em; }
+  #btn-consequence:hover { background:#2ea043; }
+  #btn-consequence:disabled { background:#1a3020; color:#3d6b45; cursor:not-allowed; }
+
+  /* ── Consequence result tiers ───────────────────────────── */
+  .tier-section { margin-top:14px; }
+  .tier-header { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .tier-badge { font-size:9px; font-weight:700; padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.08em; }
+  .tier-will  { background:#3b0f0f; color:#f85149; }
+  .tier-likely{ background:#2d1f03; color:#e3b341; }
+  .tier-aware { background:#131d2e; color:#8b949e; }
+  .tier-count { font-size:10px; color:#6e7681; }
+
+  .cq-node { padding:9px 11px; margin-bottom:6px; border-radius:6px; background:#0d1117; border:1px solid #21262d; cursor:pointer; transition: border-color 0.15s; }
+  .cq-node:hover { border-color:#30363d; }
+  .cq-node.tier-1 { border-left:3px solid #f85149; }
+  .cq-node.tier-2 { border-left:3px solid #e3b341; }
+  .cq-node.tier-3 { border-left:3px solid #30363d; }
+  .cq-node .cq-name { font-size:12px; font-weight:600; color:#e6edf3; display:flex; align-items:center; gap:6px; }
+  .cq-node .cq-meta { font-size:10px; color:#6e7681; margin-top:2px; }
+  .cq-node .cq-consequence { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; padding-top:6px; border-top:1px solid #21262d; }
+  .cq-edge-badge { font-size:9px; padding:1px 5px; background:#21262d; border-radius:3px; color:#8b949e; font-weight:400; }
+
+  /* ── Lead card ──────────────────────────────────────────── */
+  .lead-card { background:#0d1117; border:1px solid #30363d; border-radius:7px; padding:12px 14px; margin-bottom:14px; }
+  .lead-card .lead-type { font-size:9px; color:#8b949e; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:6px; }
+  .lead-card .lead-summary { font-size:12px; color:#c9d1d9; line-height:1.65; }
+  .lead-card .lead-rec { font-size:12px; color:#3fb950; line-height:1.6; margin-top:6px; font-weight:600; }
+
+  .step-list { margin-top:8px; }
+  .step-row { display:flex; gap:10px; padding:7px 0; border-bottom:1px solid #21262d; cursor:pointer; }
+  .step-row:last-child { border-bottom:none; }
+  .step-num { font-size:11px; color:#58a6ff; font-weight:700; min-width:18px; }
+  .step-name { font-size:11px; color:#e6edf3; font-weight:600; }
+  .step-action { font-size:10px; color:#8b949e; margin-top:2px; line-height:1.4; }
+
+  .option-row { display:flex; justify-content:space-between; align-items:center; padding:6px 0; border-bottom:1px solid #21262d; }
+  .option-row:last-child { border-bottom:none; }
+  .option-name { font-size:11px; color:#e6edf3; }
+  .option-cost { font-size:10px; color:#8b949e; }
+  .option-cost.cheaper { color:#3fb950; }
 </style>
 </head>
 <body>
@@ -782,27 +957,14 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
     <div id="sidebar-content">
       <p class="placeholder">Select any node in the graph to see its impact analysis, dependencies, and downstream consequences.</p>
     </div>
-    <div id="change-input-panel">
-      <div style="display:flex;gap:0;margin-bottom:8px">
-        <button id="tab-simulate" onclick="switchTab('simulate')"
-          style="flex:1;padding:5px;background:#1f6feb;border:none;border-radius:4px 0 0 4px;color:white;font-size:10px;cursor:pointer;font-family:inherit">
-          Simulate change
-        </button>
-        <button id="tab-reason" onclick="switchTab('reason')"
-          style="flex:1;padding:5px;background:#21262d;border:1px solid #30363d;border-left:none;border-radius:0 4px 4px 0;color:#8b949e;font-size:10px;cursor:pointer;font-family:inherit">
-          Reason about design
-        </button>
+    <div id="consequence-panel">
+      <div class="panel-label">
+        ⚡ View Consequence
+        <span id="cq-hint">click a node to pre-fill context</span>
       </div>
-
-      <div id="panel-simulate">
-        <textarea id="change-desc" rows="2" placeholder="e.g. Add a new tensor to the return tuple" style="width:100%;padding:7px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:11px;resize:none;outline:none;font-family:inherit"></textarea>
-        <button id="btn-simulate" onclick="simulateChange()" style="width:100%;margin-top:6px;padding:7px;background:#1f6feb;border:none;border-radius:6px;color:white;font-size:11px;cursor:pointer;font-family:inherit">Predict consequences →</button>
-      </div>
-
-      <div id="panel-reason" style="display:none">
-        <textarea id="reason-desc" rows="4" placeholder="Describe your architectural question or proposed change in plain English. Mention class/function names directly." style="width:100%;padding:7px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-size:11px;resize:none;outline:none;font-family:inherit"></textarea>
-        <button id="btn-reason" onclick="runReason()" style="width:100%;margin-top:6px;padding:7px;background:#238636;border:none;border-radius:6px;color:white;font-size:11px;cursor:pointer;font-family:inherit">Analyse design impact →</button>
-      </div>
+      <textarea id="consequence-query" rows="3"
+        placeholder="Describe a change, design question, or idea — mention function and class names directly.&#10;e.g. 'Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple'"></textarea>
+      <button id="btn-consequence" onclick="runConsequence()">Analyse consequences →</button>
     </div>
   </div>
 </div>
@@ -832,14 +994,6 @@ const EDGE_COLORS = {
   defined_in: '#21262d',
   instantiates: '#79c0ff',
 };
-
-// H1: HTML-escape helper — applied to all user-sourced data before innerHTML insertion
-function _h(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
 
 let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
@@ -1030,6 +1184,9 @@ async function selectNode(d) {
   // Wait one animation frame so simulation coordinates have settled
   requestAnimationFrame(() => flyToNode(d));
 
+  // Pre-fill the consequence textarea with node context
+  prefillConsequenceContext(d.id);
+
   const resp = await fetch(`/api/impact/${encodeURIComponent(d.id)}`);
   const impact = await resp.json();
 
@@ -1050,20 +1207,20 @@ function renderImpactSidebar(node, impact) {
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${_h(meta.type || node.type)}</span>
+      <span class="meta-pill">${meta.type || node.type}</span>
       ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
-      <span class="severity-badge sev-${_h(sev)}">${_h(sev)}</span>
+      <span class="severity-badge sev-${sev}">${sev}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${meta.line || 0}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
   }
 
   // Tensor shapes
@@ -1074,21 +1231,21 @@ function renderImpactSidebar(node, impact) {
       const conf = typeof info === 'object' ? Math.round((info.confidence || 0) * 100) : null;
       const src = typeof info === 'object' ? info.source : null;
       html += `<div class="shape-row">
-        <span class="shape-param">${_h(param)}</span>
-        <span class="shape-val">${_h(shapeVal)}</span>
-        ${conf ? `<span class="shape-conf">${conf}% · ${_h(src)}</span>` : ''}
+        <span class="shape-param">${param}</span>
+        <span class="shape-val">${shapeVal}</span>
+        ${conf ? `<span class="shape-conf">${conf}% · ${src}</span>` : ''}
       </div>`;
     }
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
       </div></div>`;
   }
 
@@ -1114,11 +1271,256 @@ function renderImpactSidebar(node, impact) {
 function renderImpactNode(e) {
   const sev = e.severity || 'low';
   const name = e.name || e.node.split('.').pop();
-  return `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
-    <div class="node-name">${_h(name)}</div>
-    <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
-    ${e.reason ? `<div class="node-reason">${_h(e.reason.substring(0, 100))}</div>` : ''}
+  return `<div class="impact-node sev-${sev}" onclick="selectNodeById('${e.node}')">
+    <div class="node-name">${name}</div>
+    <div class="node-edge">${e.edge_type} · depth ${e.depth}</div>
+    ${e.reason ? `<div class="node-reason">${e.reason.substring(0, 100)}</div>` : ''}
   </div>`;
+}
+
+// ── View Consequence ──────────────────────────────────────────────────────────
+
+// When user clicks a node, pre-fill the textarea with structured context
+async function prefillConsequenceContext(nodeId) {
+  try {
+    const resp = await fetch(`/api/node_context/${encodeURIComponent(nodeId)}`);
+    const data = await resp.json();
+    if (data.error) return;
+
+    const ta = document.getElementById('consequence-query');
+    ta.value = data.context_text;
+    ta.dataset.anchorId = nodeId;
+
+    const hint = document.getElementById('cq-hint');
+    hint.textContent = `anchored to ${data.name} · ${data.severity || ''} severity`;
+    hint.style.color = data.severity === 'critical' ? '#f85149'
+                     : data.severity === 'high'     ? '#e3b341'
+                     : '#3fb950';
+
+    // Focus at end of textarea so user types after the context
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  } catch(e) {
+    // Silently skip — textarea stays as-is
+  }
+}
+
+async function runConsequence() {
+  const ta   = document.getElementById('consequence-query');
+  const query = ta.value.trim();
+  if (!query) { alert('Describe a change, idea, or design question first.'); return; }
+
+  const anchorId = ta.dataset.anchorId || null;
+  const btn = document.getElementById('btn-consequence');
+  btn.textContent = 'Analysing…';
+  btn.disabled = true;
+
+  try {
+    const resp = await fetch('/api/consequence', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({ query, anchor_node_id: anchorId }),
+    });
+    const data = await resp.json();
+    if (data.error) { alert(data.error + (data.hint ? '\n\n' + data.hint : '')); return; }
+    renderConsequenceSidebar(data);
+    highlightConsequenceNodes(data);
+  } catch(e) {
+    alert('Request failed: ' + e.message);
+  } finally {
+    btn.textContent = 'Analyse consequences →';
+    btn.disabled = false;
+  }
+}
+
+function renderConsequenceSidebar(data) {
+  const intentLabels = {
+    specific_change: 'Specific change',
+    decision:        'Design decision',
+    removal:         'Removal',
+    exploration:     'Exploration',
+  };
+  const changeLabels = {
+    return_format_change:  '⟳ Return format',
+    signature_change:      '⟨⟩ Signature',
+    dimension_change:      '⊞ Dimension',
+    rename:                '✎ Rename',
+    removal:               '✕ Removal',
+    add_tensor_component:  '⊕ New tensor',
+    config_change:         '⚙ Config',
+    modification:          '~ Modification',
+  };
+
+  let html = '';
+
+  // ── Header badge ───────────────────────────────────────────
+  const intentLabel  = intentLabels[data.intent]  || data.intent;
+  const changeLabel  = changeLabels[data.change_type] || '';
+  html += `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+    <span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#131d2e;color:#79c0ff;text-transform:uppercase;letter-spacing:.08em">${intentLabel}</span>
+    ${changeLabel ? `<span style="font-size:9px;font-weight:700;padding:2px 8px;border-radius:10px;background:#1a1f2e;color:#8b949e;letter-spacing:.05em">${changeLabel}</span>` : ''}
+  </div>`;
+
+  // ── Lead card — adaptive per intent ────────────────────────
+  const lead = data.lead || {};
+  html += `<div class="lead-card">`;
+
+  if (lead.format === 'decision') {
+    html += `<div class="lead-type">Decision analysis</div>`;
+    if (lead.recommendation) {
+      html += `<div class="lead-rec">→ ${lead.recommendation}</div>`;
+    }
+    if (lead.options && lead.options.length) {
+      const sorted = [...lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
+      html += `<div style="margin-top:10px">`;
+      sorted.forEach((opt, i) => {
+        const cheaper = i === 0;
+        html += `<div class="option-row">
+          <span class="option-name">${opt.name}</span>
+          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${opt.downstream_count} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+  } else if (lead.format === 'removal_plan') {
+    html += `<div class="lead-type">Removal — cleanup order</div>
+      <div class="lead-summary">${lead.summary}</div>`;
+    if (lead.ordered_steps && lead.ordered_steps.length) {
+      html += `<div class="step-list">`;
+      lead.ordered_steps.forEach(s => {
+        html += `<div class="step-row" onclick="selectNodeById('${s.node}')">
+          <div class="step-num">${s.step}</div>
+          <div>
+            <div class="step-name">${s.name}</div>
+            <div class="step-action">${s.action}</div>
+          </div>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+  } else if (lead.format === 'step_by_step') {
+    html += `<div class="lead-type">Implementation plan</div>
+      <div class="lead-summary">${lead.summary}</div>`;
+    if (lead.steps && lead.steps.length) {
+      html += `<div class="step-list">`;
+      lead.steps.forEach(s => {
+        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${s.node}')"` : ''}>
+          <div class="step-num">${s.step}</div>
+          <div>
+            <div class="step-name">${s.name}</div>
+            <div class="step-action">${s.action}</div>
+          </div>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+  } else {
+    // exploration
+    html += `<div class="lead-type">Structural overview</div>
+      <div class="lead-summary">${(lead.summary || '').replace(/`([^`]+)`/g, '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff">$1</code>')}</div>`;
+  }
+  html += `</div>`;
+
+  // ── Nodes anchored in query ─────────────────────────────────
+  if (data.mentioned_details && data.mentioned_details.length) {
+    html += `<div style="font-size:10px;color:#6e7681;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em">
+      Nodes in your query (${data.mentioned_details.length})</div>`;
+    html += `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px">`;
+    data.mentioned_details.forEach(n => {
+      const sevColor = n.severity === 'critical' ? '#f85149' : n.severity === 'high' ? '#e3b341' : '#58a6ff';
+      html += `<div onclick="selectNodeById('${n.node}')"
+        style="font-size:10px;padding:3px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:${sevColor};cursor:pointer;white-space:nowrap">
+        ${n.name}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // ── Tier 1: will break ──────────────────────────────────────
+  if (data.will_break && data.will_break.length) {
+    html += `<div class="tier-section">
+      <div class="tier-header">
+        <span class="tier-badge tier-will">🔴 Will break</span>
+        <span class="tier-count">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''} — must address</span>
+      </div>`;
+    data.will_break.forEach(n => { html += renderCqNode(n, 1); });
+    html += `</div>`;
+  }
+
+  // ── Tier 2: likely need ─────────────────────────────────────
+  if (data.likely_need && data.likely_need.length) {
+    html += `<div class="tier-section">
+      <div class="tier-header">
+        <span class="tier-badge tier-likely">🟡 Likely need</span>
+        <span class="tier-count">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''} — verify before shipping</span>
+      </div>`;
+    data.likely_need.forEach(n => { html += renderCqNode(n, 2); });
+    html += `</div>`;
+  }
+
+  // ── Tier 3: be aware ────────────────────────────────────────
+  if (data.be_aware && data.be_aware.length) {
+    html += `<div class="tier-section">
+      <div class="tier-header">
+        <span class="tier-badge tier-aware">⚪ Be aware</span>
+        <span class="tier-count">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''} — in blast radius, likely safe</span>
+      </div>`;
+    data.be_aware.forEach(n => { html += renderCqNode(n, 3); });
+    html += `</div>`;
+  }
+
+  document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
+  document.getElementById('sidebar-content').innerHTML = html;
+}
+
+function renderCqNode(n, tier) {
+  const fname  = (n.file || '').split(/[/\\]/).pop();
+  const loc    = fname ? `${fname}${n.line ? ':' + n.line : ''}` : '';
+  const edges  = (n.edge_types || []).slice(0, 2).join(', ');
+  const via    = (n.via || []).join(', ');
+  const consequence = (n.consequence || '').replace(
+    /`([^`]+)`/g,
+    '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
+  );
+  const hookBadge = n.is_hook ? '<span class="cq-edge-badge" style="color:#f0883e">hook</span>' : '';
+  const shapesBadge = n.shapes && Object.keys(n.shapes).length
+    ? `<span class="cq-edge-badge">shapes</span>` : '';
+
+  return `<div class="cq-node tier-${tier}" onclick="selectNodeById('${n.node}')">
+    <div class="cq-name">
+      ${n.name}
+      ${hookBadge}${shapesBadge}
+      ${edges ? `<span class="cq-edge-badge">${edges}</span>` : ''}
+    </div>
+    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${n.intersection_count} blast radii` : ''}</div>
+    ${consequence ? `<div class="cq-consequence">${consequence}</div>` : ''}
+  </div>`;
+}
+
+function highlightConsequenceNodes(data) {
+  const highlighted = new Set(data.highlighted || []);
+  const willBreakSet = new Set((data.will_break || []).map(n => n.node));
+  const likelySet    = new Set((data.likely_need || []).map(n => n.node));
+
+  if (!nodeEl || !linkEl) return;
+
+  nodeEl.classed('dimmed',      d => !highlighted.has(d.id))
+        .classed('highlighted', d => highlighted.has(d.id))
+        .style('stroke', d => willBreakSet.has(d.id) ? '#f85149'
+                            : likelySet.has(d.id)    ? '#e3b341'
+                            : highlighted.has(d.id)  ? '#3fb950'
+                            : null)
+        .style('stroke-width', d => highlighted.has(d.id) ? '2px' : null);
+
+  linkEl.classed('dimmed', d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return !highlighted.has(s) && !highlighted.has(t);
+  });
+
+  labelEl.style('display', d => highlighted.has(d.id) ? 'block' : 'none');
 }
 
 function highlightBlastRadius(impact) {
@@ -1162,9 +1564,9 @@ searchBox.addEventListener('input', async () => {
   const data = await resp.json();
   if (!data.results.length) { searchResults.style.display = 'none'; return; }
   searchResults.innerHTML = data.results.map(r => `
-    <div class="search-result" onclick="selectNodeById('${_h(r.id)}'); searchResults.style.display='none'; searchBox.value='';">
-      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${_h(r.name)}</span>
-      <span class="node-type">${_h(r.type)} · ${_h(r.id.split('.').slice(0,-1).join('.'))}</span>
+    <div class="search-result" onclick="selectNodeById('${r.id}'); searchResults.style.display='none'; searchBox.value='';">
+      <span style="color:${NODE_COLORS[r.type]||'#8b949e'}">${r.name}</span>
+      <span class="node-type">${r.type} · ${r.id.split('.').slice(0,-1).join('.')}</span>
     </div>`).join('');
   searchResults.style.display = 'block';
 });
@@ -1173,221 +1575,7 @@ document.addEventListener('click', e => {
   if (!searchBox.contains(e.target)) searchResults.style.display = 'none';
 });
 
-function switchTab(tab) {
-  const isSimulate = tab === 'simulate';
-  document.getElementById('panel-simulate').style.display = isSimulate ? 'block' : 'none';
-  document.getElementById('panel-reason').style.display = isSimulate ? 'none' : 'block';
-  document.getElementById('tab-simulate').style.background = isSimulate ? '#1f6feb' : '#21262d';
-  document.getElementById('tab-simulate').style.color = isSimulate ? 'white' : '#8b949e';
-  document.getElementById('tab-reason').style.background = isSimulate ? '#21262d' : '#238636';
-  document.getElementById('tab-reason').style.color = isSimulate ? '#8b949e' : 'white';
-}
 
-async function runReason() {
-  const query = document.getElementById('reason-desc').value.trim();
-  if (!query) { alert('Describe your design question or proposed change.'); return; }
-
-  const btn = document.getElementById('btn-reason');
-  btn.textContent = 'Analysing...';
-  btn.disabled = true;
-
-  try {
-    const resp = await fetch('/api/reason', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({query})
-    });
-    const data = await resp.json();
-    if (data.error) { alert(data.error + '\n' + (data.hint || '')); return; }
-    renderReasonSidebar(data);
-  } finally {
-    btn.textContent = 'Analyse design impact →';
-    btn.disabled = false;
-  }
-}
-
-function renderReasonSidebar(data) {
-  const intentLabels = {
-    add_tensor_component: '⊞ Add tensor component',
-    add_feature: '+ Add feature',
-    refactor_location: '⟳ Refactor location',
-    removal: '✕ Removal',
-    design_question: '? Design question',
-    general_query: '~ General query',
-  };
-
-  let html = `
-    <div style="background:#1a1f2e;border-radius:6px;padding:10px 12px;margin-bottom:12px">
-      <div style="font-size:10px;color:#8b949e;margin-bottom:3px">Intent classified as</div>
-      <div style="color:#79c0ff;font-size:12px;font-weight:600">${_h(intentLabels[data.query_intent] || data.query_intent)}</div>
-    </div>`;
-
-  // Summary
-  if (data.summary) {
-    html += `<div style="color:#8b949e;font-size:11px;line-height:1.6;margin-bottom:12px;padding:8px 10px;background:#0d1117;border-radius:5px">${_h(data.summary)}</div>`;
-  }
-
-  // Mentioned nodes
-  if (data.mentioned_node_details?.length) {
-    html += `<div class="impact-section"><h3>Nodes found in query (${data.mentioned_node_details.length})</h3>`;
-    data.mentioned_node_details.forEach(n => {
-      const fname = (n.file || '').split(/[\/\\]/).pop();
-      html += `<div class="impact-node sev-medium" onclick="selectNodeById('${_h(n.node)}')">
-        <div class="node-name">${_h(n.name)}</div>
-        <div class="node-edge">${_h(fname)}${n.line ? ':' + n.line : ''}</div>
-      </div>`;
-    });
-    html += `</div>`;
-  }
-
-  // Must change
-  if (data.must_change?.length) {
-    html += `<div class="impact-section"><h3>🔴 Must address (${data.must_change.length})</h3>`;
-    data.must_change.forEach(n => {
-      html += renderReasonNode(n);
-    });
-    html += `</div>`;
-  }
-
-  // Likely change
-  if (data.likely_change?.length) {
-    html += `<div class="impact-section"><h3>🟡 Likely affected (${data.likely_change.length})</h3>`;
-    data.likely_change.forEach(n => {
-      html += renderReasonNode(n);
-    });
-    html += `</div>`;
-  }
-
-  // Highlight all relevant nodes in graph
-  const allRelevant = new Set([
-    ...(data.mentioned_nodes || []),
-    ...(data.must_change || []).map(n => n.node),
-    ...(data.likely_change || []).map(n => n.node),
-  ]);
-  if (nodeEl && linkEl) {
-    nodeEl.classed('dimmed', d => !allRelevant.has(d.id))
-      .classed('highlighted', d => allRelevant.has(d.id));
-    linkEl.classed('dimmed', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return !allRelevant.has(s) && !allRelevant.has(t);
-    });
-    labelEl.style('display', d => allRelevant.has(d.id) ? 'block' : 'none');
-  }
-
-  document.getElementById('sidebar-title').textContent = 'Design impact analysis';
-  document.getElementById('sidebar-content').innerHTML = html;
-}
-
-function renderReasonNode(n) {
-  const fname = (n.file || '').split(/[\/\\]/).pop();
-  const origins = (n.origins || []).slice(0, 3).join(', ');
-  return `<div class="impact-node sev-high" onclick="selectNodeById('${_h(n.node)}')">
-    <div class="node-name">${_h(n.name)}
-      <span style="font-size:9px;color:#6e7681;font-weight:400;margin-left:6px">in ${n.intersection_count} blast radii</span>
-    </div>
-    <div class="node-edge">${_h(fname)}${n.line ? ':' + n.line : ''} · via ${_h(origins)}</div>
-    ${n.annotation ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${_h(n.annotation)}</div>` : ''}
-  </div>`;
-}
-
-// Simulate change
-async function simulateChange() {
-  const desc = document.getElementById('change-desc').value.trim();
-  if (!selectedNodeId) {
-    alert('Select a node first, then describe your change.');
-    return;
-  }
-  if (!desc) {
-    alert('Describe the change you want to make.');
-    return;
-  }
-
-  const btn = document.getElementById('btn-simulate');
-  btn.textContent = 'Analysing...';
-  btn.disabled = true;
-
-  try {
-    const resp = await fetch(
-      `/api/simulate?node_id=${encodeURIComponent(selectedNodeId)}&change=${encodeURIComponent(desc)}`
-    );
-    const impact = await resp.json();
-    if (impact.error) {
-      alert(impact.error);
-      return;
-    }
-
-    const node = allNodes.find(n => n.id === selectedNodeId) || {};
-    renderSimulateSidebar(node, impact);
-    highlightBlastRadius(impact);
-  } finally {
-    btn.textContent = 'Predict consequences →';
-    btn.disabled = false;
-  }
-}
-
-function renderSimulateSidebar(node, impact) {
-  const br = impact.blast_radius || {};
-  const changeType = impact.change_type || 'modification';
-  const sev = impact.severity || 'low';
-
-  const changeTypeLabels = {
-    return_format_change: '⟳ Return format change',
-    signature_change: '⟨⟩ Signature change',
-    dimension_change: '⊞ Dimension change',
-    rename: '✎ Rename / move',
-    removal: '✕ Removal',
-    config_change: '⚙ Config change',
-    data_format_change: '⊟ Data format change',
-    modification: '~ General modification',
-  };
-
-  let html = `
-    <div style="background:#1a1f2e;border-radius:6px;padding:10px 12px;margin-bottom:12px">
-      <div style="font-size:10px;color:#8b949e;margin-bottom:4px">Change detected as</div>
-      <div style="color:#79c0ff;font-size:12px;font-weight:600">${_h(changeTypeLabels[changeType] || changeType)}</div>
-      <div style="color:#6e7681;font-size:10px;margin-top:4px;font-style:italic">"${_h(impact.change_description)}"</div>
-    </div>
-    <div class="meta-row">
-      <span class="severity-badge sev-${_h(sev)}">${_h(sev)} impact</span>
-      <span class="meta-pill">${br.downstream_count || 0} affected</span>
-    </div>`;
-
-  // Critical path
-  if (impact.critical_path && impact.critical_path.length > 1) {
-    html += `<div class="impact-section"><h3>Propagation path</h3>
-      <div style="font-size:10px;color:#8b949e;word-break:break-all;line-height:1.8">
-        ${impact.critical_path.map((n, i) => {
-          const name = n.split('.').pop();
-          const color = i === 0 ? '#f85149' : i === impact.critical_path.length - 1 ? '#e3b341' : '#79c0ff';
-          return `<span style="color:${color}">${_h(name)}</span>`;
-        }).join(' → ')}
-      </div></div>`;
-  }
-
-  // Downstream with consequence annotations
-  const downstream = (br.downstream || []).filter(e =>
-    !e.node.startsWith('hook::') && !e.node.startsWith('config::')
-  ).slice(0, 20);
-
-  if (downstream.length > 0) {
-    html += `<div class="impact-section"><h3>What breaks (${downstream.length} shown)</h3>`;
-    downstream.forEach(e => {
-      const sev = e.severity || 'low';
-      const name = e.name || e.node.split('.').pop();
-      const consequence = e.consequence || e.reason || '';
-      html += `<div class="impact-node sev-${_h(sev)}" onclick="selectNodeById('${_h(e.node)}')">
-        <div class="node-name">${_h(name)}</div>
-        <div class="node-edge">${_h(e.edge_type)} · depth ${_h(e.depth)}</div>
-        ${consequence ? `<div class="node-reason" style="color:#c9d1d9;margin-top:3px">${_h(consequence)}</div>` : ''}
-      </div>`;
-    });
-    html += `</div>`;
-  }
-
-  document.getElementById('sidebar-title').textContent = `Simulate: ${node.name || selectedNodeId.split('.').pop()}`;
-  document.getElementById('sidebar-content').innerHTML = html;  // node.name goes via textContent — safe
-}
 
 // Diff
 async function loadDiff() {
@@ -1400,9 +1588,9 @@ async function loadDiff() {
   let html = `<div style="color:#8b949e;font-size:11px;margin-bottom:10px">
     Changed files: ${data.changed_files.length}</div>`;
   data.impacts.forEach(imp => {
-    html += `<div class="impact-node sev-${_h(imp.severity || 'low')}" onclick="selectNodeById('${_h(imp.target)}')">
-      <div class="node-name">${_h(imp.function)}</div>
-      <div class="node-edge">${_h(imp.severity)} · ${imp.downstream_count} downstream</div>
+    html += `<div class="impact-node sev-${imp.severity || 'low'}" onclick="selectNodeById('${imp.target}')">
+      <div class="node-name">${imp.function}</div>
+      <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
     </div>`;
   });
   document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
@@ -1432,7 +1620,7 @@ def main():
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description="consequencegraph visual server")
-    parser.add_argument("--path", default="./neural_lam_cached", help="Path to index")
+    parser.add_argument("--path", default="./neural_lam", help="Path to index")
     parser.add_argument("--preset", default=None, choices=["neural_lam"])
     parser.add_argument("--port", type=int, default=7842)
     parser.add_argument("--reindex", action="store_true")
@@ -1440,7 +1628,7 @@ def main():
 
     build_or_load_graph(args.path, preset=args.preset, force_reindex=args.reindex)
     print(f"[consequencegraph server] Open http://localhost:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")  # M5: enable HTTP access logs
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
