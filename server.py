@@ -25,7 +25,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query, Path
+    from fastapi import FastAPI, HTTPException, Request, Query
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -38,22 +38,20 @@ except ImportError:
 PRODUCTION = os.environ.get("CONSEQUENCEGRAPH_ENV") == "production"
 RATE_LIMIT_WINDOW = 60        # seconds
 RATE_LIMIT_MAX    = 60        # requests per window per IP
-RATE_BUCKETS_MAX  = 10_000   # max IPs tracked (H2: evict oldest beyond this)
-CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")  # H3: set in render.yaml
+RATE_BUCKETS_MAX  = 10_000   # cap tracked IPs to prevent memory leak (H2)
+CORS_ORIGIN = os.environ.get("CORS_ALLOW_ORIGIN", "*")  # H3: restrict in prod via render.yaml
 
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
 
 _rate_buckets: dict = defaultdict(list)
 
-
 def _get_real_ip(request) -> str:
-    """Return real client IP, honouring X-Forwarded-For from proxy/LB (H2)."""
+    """Real client IP behind proxy/LB (H2: X-Forwarded-For)."""
     xff = request.headers.get("X-Forwarded-For")
     if xff:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
-
 
 def check_rate_limit(ip: str) -> bool:
     now = time.time()
@@ -62,8 +60,7 @@ def check_rate_limit(ip: str) -> bool:
     if len(_rate_buckets[ip]) >= RATE_LIMIT_MAX:
         return False
     _rate_buckets[ip].append(now)
-    # H2: cap memory — evict oldest IP when map exceeds limit
-    if len(_rate_buckets) > RATE_BUCKETS_MAX:
+    if len(_rate_buckets) > RATE_BUCKETS_MAX:  # H2: evict oldest
         oldest = next(iter(_rate_buckets))
         del _rate_buckets[oldest]
     return True
@@ -87,8 +84,7 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
-    # If a cache.json lives directly inside --path (pre-built deployment), use it.
-    # Otherwise fall back to the live-index dev cache at .consequencegraph/cache.json.
+    # C4: prefer <path>/cache.json (pre-built on Render); fall back to dev-mode path
     _path_cache = os.path.join(_index_path, "cache.json")
     cache = _path_cache if os.path.isfile(_path_cache) else os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
 
@@ -120,7 +116,7 @@ app.add_middleware(CORSMiddleware, allow_origins=[CORS_ORIGIN], allow_methods=["
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if PRODUCTION and request.url.path.startswith("/api/"):
-        ip = _get_real_ip(request)  # H2: real IP behind Render proxy
+        ip = _get_real_ip(request)  # H2: real IP behind Render LB
         if not check_rate_limit(ip):
             return JSONResponse({"error": "Rate limit exceeded. Try again in a minute."}, status_code=429)
     return await call_next(request)
@@ -224,13 +220,11 @@ async def api_consequence(request: Request):
 
     if not query_text:
         raise HTTPException(status_code=400, detail="query field required")
-    if len(query_text) > 1000:  # H4: prevent O(n × |q|) regex DoS
-        raise HTTPException(status_code=400, detail="query too long (max 1000 characters)")
-
-    # C2: validate anchor_id exists in graph before trusting it
-    if anchor_id is not None:
-        if not isinstance(anchor_id, str) or len(anchor_id) > 500:
-            anchor_id = None
+    if len(query_text) > 1000:  # H4: cap to prevent O(n×|q|) regex DoS
+        raise HTTPException(status_code=400, detail="query too long (max 1000 chars)")
+    # C2: validate anchor_id before trusting it
+    if anchor_id is not None and (not isinstance(anchor_id, str) or len(anchor_id) > 500):
+        anchor_id = None
 
     graph  = get_graph()
     engine = get_engine()
@@ -288,15 +282,33 @@ async def api_consequence(request: Request):
     HIGH_RISK = {"produces_tensor_for", "overrides_hook", "inherits"}
     MED_RISK  = {"consumes_format", "reads_config", "calls"}
 
-    will_break  = []  # tier 1 — non-negotiable
-    likely_need = []  # tier 2 — high probability
-    be_aware    = []  # tier 3 — in blast radius, probably safe
+    # Bug 6: edge types that indicate real breakage vs. mere proximity
+    PROXIMITY_ONLY = {"imports", "defined_in", "named_reference"}
+
+    will_break  = []
+    likely_need = []
+    be_aware    = []
 
     for nid, score in sorted(intersection_scores.items(), key=lambda x: -x[1]):
         node_data  = graph.get_node(nid) or {}
+        file_path  = node_data.get("file_path", "")
         edges      = edge_types_by_node.get(nid, set())
         depth      = depth_by_node.get(nid, 3)
         reasons    = reasons_by_node.get(nid, [])
+
+        # Bug 6: never put external library nodes in will_break or likely_need
+        if _is_external_node(nid, file_path):
+            continue
+
+        # Bug 6: proximity-only edges (imports, defined_in) don't indicate breakage
+        if edges and edges.issubset(PROXIMITY_ONLY):
+            continue
+
+        # Bug 6: pure upstream inheritance from a base class doesn't mean it breaks
+        all_directions = {r["direction"] for r in reasons}
+        upstream_only = all_directions == {"upstream"}
+        if upstream_only and edges.issubset({"inherits", "imports", "defined_in"}):
+            continue
 
         # Compute tier score
         tier_score = score * 2
@@ -315,7 +327,7 @@ async def api_consequence(request: Request):
             "node":       nid,
             "name":       node_data.get("name", nid.split(".")[-1]),
             "type":       node_data.get("node_type", ""),
-            "file":       node_data.get("file_path", ""),
+            "file":       file_path,
             "line":       node_data.get("line_no", 0),
             "is_hook":    node_data.get("is_lightning_hook", False),
             "shapes":     node_data.get("tensor_shapes", {}),
@@ -352,7 +364,7 @@ async def api_consequence(request: Request):
         "intent":        intent,
         "change_type":   change_type,
         "query":         query_text,
-        "anchor":        anchor_id if (anchor_id and graph.has_node(anchor_id)) else None,  # M4: only echo valid anchors
+        "anchor":        anchor_id if (anchor_id and graph.has_node(anchor_id)) else None,  # C2: only echo valid
         "mentioned":     mentioned,
         "mentioned_details": [
             {
@@ -374,10 +386,51 @@ async def api_consequence(request: Request):
 
 # ── Consequence helpers ───────────────────────────────────────────────────────
 
+# Bug 4: NLP stopwords — common English narrative words and domain terms that
+# appear in natural-language queries but should never be matched as code nodes.
+_NLP_STOPWORDS = {
+    # English narrative / intent words
+    "downstream", "upstream", "change", "changes", "modify", "modification",
+    "update", "updates", "approach", "design", "idea", "concept", "feature",
+    "implement", "implementation", "add", "remove", "refactor", "integrate",
+    "handle", "handling", "compute", "calculation", "dynamic", "static",
+    "should", "could", "would", "will", "think", "since", "also", "either",
+    "rather", "already", "during", "every", "inside", "across", "between",
+    "instead", "feels", "natural", "extension", "strict", "highly",
+    # ML domain narrative words that happen to match node names
+    "forcing", "batch", "loss", "mask", "weight", "buffer", "graph",
+    "model", "layer", "module", "step", "forward", "backward", "train",
+    "valid", "test", "data", "output", "input", "result", "value",
+    "tensor", "shape", "size", "index", "node", "edge", "mesh",
+    # Python keywords that appear as node fragments
+    "init", "self", "true", "false", "none", "type", "class", "base",
+}
+
+# Bug 6: External library prefixes — nodes from these are never in the "will break" tier
+_EXTERNAL_NODE_PREFIXES = {
+    "torch", "nn", "numpy", "np", "pytorch_lightning", "pl",
+    "scipy", "sklearn", "pandas", "matplotlib", "wandb",
+    "omegaconf", "hydra", "einops", "jaxtyping",
+}
+
+
+def _is_external_node(node_id: str, file_path: str) -> bool:
+    """Return True if this node belongs to an external library, not target codebase."""
+    if file_path == "<external>":
+        return True
+    prefix = node_id.split(".")[0]
+    if prefix in _EXTERNAL_NODE_PREFIXES:
+        return True
+    return False
+
+
 def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list:
     found, seen = [], set()
     candidates = []
     for nid, data in graph.g.nodes(data=True):
+        # Bug 6: skip external nodes entirely from NLP extraction
+        if _is_external_node(nid, data.get("file_path", "")):
+            continue
         name = data.get("name", "")
         if name and len(name) > 3:
             candidates.append((nid, name))
@@ -389,6 +442,9 @@ def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list:
     deduped.sort(key=lambda x: -len(x[1]))
     for nid, name in deduped:
         if nid in seen:
+            continue
+        # Bug 4: skip stopwords — don't match narrative English as code nodes
+        if name.lower() in _NLP_STOPWORDS:
             continue
         if re.search(r'\b' + re.escape(name) + r'\b', query, re.IGNORECASE):
             found.append(nid)
@@ -517,21 +573,26 @@ def _cq_build_lead(
     total_structural = len(will_break) + len(likely_need)
 
     if intent == "decision":
-        # Find candidate location nodes — the "or" options
-        # Try to detect A vs B from mentioned nodes
-        names = [(graph.get_node(n) or {}).get("name", n.split(".")[-1]) for n in mentioned]
-        # Score each mentioned node as an "option" by its own blast radius size
+        # Bug 5: only compare function/class nodes — never modules, tensor contracts,
+        # or metadata nodes. Comparing a module namespace to a function is invalid.
+        EXECUTABLE_TYPES = {"function", "class"}
         options = []
         for nid in mentioned:
+            node_data_m = graph.get_node(nid) or {}
+            if node_data_m.get("node_type") not in EXECUTABLE_TYPES:
+                continue
+            if _is_external_node(nid, node_data_m.get("file_path", "")):
+                continue
             impact = impacts.get(nid, {})
             br = impact.get("blast_radius", {})
             downstream = [
                 e for e in br.get("downstream", [])
                 if not e["node"].startswith(("hook::", "config::", "tensor_contract::"))
+                and not _is_external_node(e["node"], e.get("file_path", ""))
             ]
             options.append({
                 "node":  nid,
-                "name":  (graph.get_node(nid) or {}).get("name", nid.split(".")[-1]),
+                "name":  node_data_m.get("name", nid.split(".")[-1]),
                 "downstream_count": len(downstream),
                 "severity": impact.get("severity", "low"),
             })
@@ -645,13 +706,13 @@ def _cq_build_lead(
 
 
 @app.get("/api/node_context/{node_id:path}")
-def api_node_context(node_id: str = Path(..., max_length=500)):  # H4: path param limit via Path()
+def api_node_context(node_id: str):
     """Return pre-population context for a node — shown in textarea when user clicks."""
     graph  = get_graph()
     engine = get_engine()
-    if not graph.has_node(node_id):  # C3: validate node exists before reflecting
-        return {"error": "Node not found"}
     data   = graph.get_node(node_id)
+    if not data:
+        return {"error": "Node not found"}
 
     name     = data.get("name", node_id.split(".")[-1])
     ntype    = data.get("node_type", "")
@@ -694,13 +755,11 @@ def api_node_context(node_id: str = Path(..., max_length=500)):  # H4: path para
     }
 
 
-
-
 @app.get("/api/diff")
 def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before git
     """Return impact for all functions changed vs git base branch."""
     if not re.match(r'^[a-zA-Z0-9/_.\.\-]{1,100}$', base) or base.startswith('-'):
-        raise HTTPException(status_code=400, detail="Invalid base ref. Use a valid branch or commit name.")
+        raise HTTPException(status_code=400, detail="Invalid base ref.")
     try:
         result = subprocess.run(
             ["git", "diff", base, "--name-only"],
@@ -708,7 +767,7 @@ def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before 
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
     except Exception:
-        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2: don't leak paths
+        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -967,12 +1026,10 @@ const EDGE_COLORS = {
   instantiates: '#79c0ff',
 };
 
-// H1: HTML-escape helper — applied to all user-sourced data before innerHTML insertion
+// H1: HTML-escape — applied to all server-sourced data before innerHTML
 function _h(s) {
   if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
@@ -1460,7 +1517,7 @@ function renderCqNode(n, tier) {
   const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
   const edges  = (n.edge_types || []).slice(0, 2).map(_h).join(', ');
   const via    = (n.via || []).map(_h).join(', ');
-  // consequence text uses backtick→<code> substitution — apply _h FIRST, then substitute
+  // Apply _h FIRST then substitute backtick→<code> so injected backtick content can't escape
   const consequence = _h(n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
