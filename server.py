@@ -72,7 +72,10 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
-    cache = os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
+    # If a cache.json lives directly inside --path (pre-built deployment), use it.
+    # Otherwise fall back to the live-index dev cache at .consequencegraph/cache.json.
+    _path_cache = os.path.join(_index_path, "cache.json")
+    cache = _path_cache if os.path.isfile(_path_cache) else os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
 
     _graph = KnowledgeGraph()
     _graph.CACHE_FILE = cache
