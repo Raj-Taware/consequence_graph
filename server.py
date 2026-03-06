@@ -26,7 +26,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query
+    from fastapi import FastAPI, HTTPException, Request,Query 
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -623,6 +623,7 @@ def _infer_arity_delta(query: str, source_node_id: str, graph: KnowledgeGraph) -
 
 
 
+def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list[str]:
     """
     Extract codebase node IDs mentioned in free-form query text.
 
@@ -1268,9 +1269,171 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .arity-card .arity-node { font-size:12px; font-weight:600; color:#f85149; }
   .arity-card .arity-loc  { font-size:10px; color:#6e7681; margin-top:1px; }
   .arity-card .arity-msg  { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; }
+
+  /* ── Welcome overlay ────────────────────────────────────── */
+  #welcome-overlay {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(1,4,9,0.92); backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center;
+    animation: fadeIn 0.3s ease;
+  }
+  #welcome-overlay.hidden { display: none; }
+  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+
+  .welcome-box {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 36px 40px; max-width: 560px; width: 90%;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+  }
+  .welcome-box .wc-logo { font-size: 28px; margin-bottom: 6px; }
+  .welcome-box h2 { font-size: 18px; color: #e6edf3; margin-bottom: 8px; font-weight: 700; }
+  .welcome-box .wc-sub {
+    font-size: 12px; color: #8b949e; line-height: 1.7; margin-bottom: 24px;
+    border-left: 2px solid #30363d; padding-left: 12px;
+  }
+  .welcome-box .wc-sub strong { color: #58a6ff; font-weight: 600; }
+
+  .wc-section-label {
+    font-size: 9px; color: #6e7681; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 10px;
+  }
+  .wc-examples { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
+  .wc-example {
+    padding: 10px 14px; background: #0d1117; border: 1px solid #21262d;
+    border-radius: 7px; cursor: pointer; transition: border-color 0.15s, background 0.15s;
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  .wc-example:hover { border-color: #3fb950; background: #0d1a12; }
+  .wc-example .wc-ex-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+  .wc-example .wc-ex-text { font-size: 11px; color: #c9d1d9; line-height: 1.5; }
+  .wc-example .wc-ex-text em { color: #79c0ff; font-style: normal; font-size: 10px; display: block; margin-top: 2px; }
+
+  .wc-footer { display: flex; align-items: center; justify-content: space-between; }
+  .wc-how { font-size: 10px; color: #6e7681; line-height: 1.6; }
+  .wc-how span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
+  .wc-how span::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3fb950; }
+  #btn-dismiss-welcome {
+    padding: 9px 20px; background: #238636; border: none; border-radius: 7px;
+    color: white; font-size: 12px; cursor: pointer; font-family: inherit;
+    font-weight: 600; white-space: nowrap; transition: background 0.15s;
+  }
+  #btn-dismiss-welcome:hover { background: #2ea043; }
+
+  /* ── Hot nodes (empty sidebar state) ───────────────────── */
+  .hot-nodes-section { padding: 4px 0; }
+  .hot-nodes-label {
+    font-size: 9px; color: #6e7681; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 10px;
+  }
+  .hot-node-card {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px; margin-bottom: 6px; background: #0d1117;
+    border: 1px solid #21262d; border-radius: 7px; cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .hot-node-card:hover { border-color: #30363d; }
+  .hot-node-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .hot-node-info { flex: 1; min-width: 0; }
+  .hot-node-name { font-size: 12px; color: #e6edf3; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hot-node-meta { font-size: 10px; color: #6e7681; margin-top: 1px; }
+  .hot-node-sev { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; text-transform: uppercase; }
+  .hot-sev-critical { background: #490202; color: #f85149; }
+  .hot-sev-high     { background: #2d1f03; color: #e3b341; }
+  .hot-sev-medium   { background: #0d2211; color: #3fb950; }
+  .hot-sev-low      { background: #131d2e; color: #58a6ff; }
+
+  .sidebar-intro {
+    font-size: 11px; color: #6e7681; line-height: 1.65;
+    padding: 12px 14px; background: #0d1117; border-radius: 7px;
+    border: 1px solid #21262d; margin-bottom: 16px;
+  }
+  .sidebar-intro strong { color: #8b949e; }
+
+  /* ── Query example chips ────────────────────────────────── */
+  .query-chips { display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
+  .query-chip {
+    padding: 5px 9px; background: #0d1117; border: 1px solid #21262d;
+    border-radius: 5px; font-size: 10px; color: #8b949e; cursor: pointer;
+    transition: border-color 0.12s, color 0.12s; line-height: 1.4;
+    text-align: left;
+  }
+  .query-chip:hover { border-color: #3fb950; color: #c9d1d9; }
+  .query-chip-label { font-size: 9px; color: #6e7681; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }
+
+  /* ── Edge type tooltips ─────────────────────────────────── */
+  .cq-edge-badge { position: relative; }
+  .cq-edge-badge .edge-tooltip {
+    display: none; position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%); width: 180px; padding: 7px 10px;
+    background: #1c2128; border: 1px solid #30363d; border-radius: 6px;
+    font-size: 10px; color: #c9d1d9; line-height: 1.5; z-index: 200;
+    pointer-events: none; white-space: normal;
+  }
+  .cq-edge-badge .edge-tooltip::after {
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 5px solid transparent; border-top-color: #30363d;
+  }
+  .cq-edge-badge:hover .edge-tooltip { display: block; }
+
+  /* ── Improved legend ────────────────────────────────────── */
+  #legend { max-width: 180px; }
+  .legend-row .legend-desc { font-size: 9px; color: #6e7681; margin-left: 4px; }
+
+  /* ── Onboarding hint pulses ─────────────────────────────── */
+  @keyframes pulse-border {
+    0%, 100% { border-color: #30363d; }
+    50% { border-color: #3fb950; box-shadow: 0 0 0 2px rgba(63,185,80,0.15); }
+  }
+  .pulse-hint { animation: pulse-border 2s ease-in-out 3; }
 </style>
 </head>
 <body>
+
+<!-- ── Welcome overlay ────────────────────────────────────── -->
+<div id="welcome-overlay">
+  <div class="welcome-box">
+    <div class="wc-logo">⬡</div>
+    <h2>consequencegraph</h2>
+    <p class="wc-sub">
+      A cross-repo static analysis tool that makes <strong>invisible ML couplings visible</strong> —
+      Lightning hook contracts, tensor format agreements, and disk-format dependencies between
+      <strong>wmg</strong> and <strong>neural-lam</strong> that no IDE can see.
+    </p>
+
+    <div class="wc-section-label">Try an example query →</div>
+    <div class="wc-examples">
+      <div class="wc-example" onclick="dismissAndQuery('What breaks in neural-lam if I change the output format of to_pyg?')">
+        <div class="wc-ex-icon">🔴</div>
+        <div class="wc-ex-text">
+          What breaks if I change <code>to_pyg()</code>'s output format?
+          <em>Cross-repo blast radius — wmg serializer → neural-lam load pipeline</em>
+        </div>
+      </div>
+      <div class="wc-example" onclick="dismissAndQuery('What Lightning hooks does WeatherDataset.__getitem__ affect if I add a tensor to its return tuple?')">
+        <div class="wc-ex-icon">⚡</div>
+        <div class="wc-ex-text">
+          What Lightning hooks does <code>WeatherDataset.__getitem__</code> affect?
+          <em>Tensor format change → training_step → forward cascade</em>
+        </div>
+      </div>
+      <div class="wc-example" onclick="dismissAndQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">
+        <div class="wc-ex-icon">⚖️</div>
+        <div class="wc-ex-text">
+          Compare modifying <code>g2m</code> vs <code>m2m</code> — which is cheaper?
+          <em>Design decision — structural cost comparison</em>
+        </div>
+      </div>
+    </div>
+
+    <div class="wc-footer">
+      <div class="wc-how">
+        <span>Click a node to see its blast radius</span>
+        <span>Type a query to analyse consequences</span>
+      </div>
+      <button id="btn-dismiss-welcome" onclick="dismissWelcome()">Explore the graph →</button>
+    </div>
+  </div>
+</div>
 
 <div id="topbar">
   <h1>⬡ consequencegraph</h1>
@@ -1293,21 +1456,41 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
       <div class="legend-row"><div class="legend-dot" style="background:#f85149"></div>tensor contract</div>
       <div class="legend-row"><div class="legend-dot" style="background:#e3b341"></div>config key</div>
       <div class="legend-row"><div class="legend-dot" style="background:#3fb950"></div>module</div>
-    </ul>
+      <div class="legend-row"><div class="legend-dot" style="background:#79c0ff"></div>format contract</div>
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid #21262d">
+        <div style="font-size:9px;color:#6e7681;margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em">Edge types</div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#f85149;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">produces tensor</span></div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#e3b341;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">consumes format</span></div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#58a6ff;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">calls</span></div>
+        <div class="legend-row"><div style="width:18px;height:2px;background:#d2a8ff;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">inherits</span></div>
+      </div>
     </div>
   </div>
 
   <div id="sidebar">
     <div id="sidebar-header">
-      <h2 id="sidebar-title">Click a node to explore</h2>
+      <h2 id="sidebar-title">Start exploring</h2>
     </div>
     <div id="sidebar-content">
-      <p class="placeholder">Select any node in the graph to see its impact analysis, dependencies, and downstream consequences.</p>
+      <div class="sidebar-intro">
+        <strong>Two ways to explore:</strong><br>
+        Click any node in the graph to see what it affects — or describe a change in the panel below and get a ranked consequence breakdown.
+      </div>
+      <div class="hot-nodes-section">
+        <div class="hot-nodes-label">Most structurally central nodes</div>
+        <div id="hot-nodes-list"><div style="color:#6e7681;font-size:11px">Loading...</div></div>
+      </div>
     </div>
     <div id="consequence-panel">
       <div class="panel-label">
         ⚡ View Consequence
         <span id="cq-hint">click a node to pre-fill context</span>
+      </div>
+      <div class="query-chip-label">Example queries</div>
+      <div class="query-chips">
+        <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">🔴 What breaks if I change <code>to_pyg()</code>?</button>
+        <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">⚡ Add tensor to <code>__getitem__</code> return tuple</button>
+        <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">⚖️ Compare <code>g2m</code> vs <code>m2m</code> impact</button>
       </div>
       <textarea id="consequence-query" rows="3"
         placeholder="Describe a change, design question, or idea — mention function and class names directly.&#10;e.g. 'Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple'"></textarea>
@@ -1871,24 +2054,28 @@ function renderConsequenceSidebar(data) {
 
 function renderCqNode(n, tier) {
   const fname  = (n.file || '').split(/[/\\]/).pop();
-  const loc    = fname ? `${fname}${n.line ? ':' + n.line : ''}` : '';
-  const edges  = (n.edge_types || []).slice(0, 2).join(', ');
-  const via    = (n.via || []).join(', ');
-  const consequence = (n.consequence || '').replace(
+  const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
+  const edgeTypes = (n.edge_types || []).slice(0, 2);
+  const via    = (n.via || []).map(_h).join(', ');
+  const consequence = _h(n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
   );
-  const hookBadge = n.is_hook ? '<span class="cq-edge-badge" style="color:#f0883e">hook</span>' : '';
+  const hookBadge = n.is_hook ? '<span class="cq-edge-badge" style="color:#f0883e">hook<span class="edge-tooltip">PyTorch Lightning hook — the framework enforces this signature contract.</span></span>' : '';
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
-    ? `<span class="cq-edge-badge">shapes</span>` : '';
+    ? `<span class="cq-edge-badge">shapes<span class="edge-tooltip">This node has known tensor shape contracts.</span></span>` : '';
+  const edgeBadges = edgeTypes.map(et => {
+    const tip = EDGE_TOOLTIP_TEXT[et] || '';
+    return `<span class="cq-edge-badge">${_h(et)}${tip ? `<span class="edge-tooltip">${_h(tip)}</span>` : ''}</span>`;
+  }).join('');
 
-  return `<div class="cq-node tier-${tier}" onclick="selectNodeById('${n.node}')">
+  return `<div class="cq-node tier-${_h(tier)}" onclick="selectNodeById('${_h(n.node)}')">
     <div class="cq-name">
-      ${n.name}
+      ${_h(n.name)}
       ${hookBadge}${shapesBadge}
-      ${edges ? `<span class="cq-edge-badge">${edges}</span>` : ''}
+      ${edgeBadges}
     </div>
-    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${n.intersection_count} blast radii` : ''}</div>
+    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${_h(n.intersection_count)} blast radii` : ''}</div>
     ${consequence ? `<div class="cq-consequence">${consequence}</div>` : ''}
   </div>`;
 }
@@ -1999,8 +2186,99 @@ async function reindex() {
   location.reload();
 }
 
-// Init
-loadGraph();
+// ── Onboarding ────────────────────────────────────────────────────────────────
+
+const EDGE_TOOLTIP_TEXT = {
+  produces_tensor_for: "This node outputs a tensor that feeds directly into the target — shape or format changes cascade downstream.",
+  consumes_format:     "This node expects data in a specific format from the source. If the source format changes, this node breaks.",
+  calls:               "Direct function call — a signature change in the source breaks this call site.",
+  inherits:            "Class inheritance — the child class is affected by changes to parent methods or attributes.",
+  overrides_hook:      "PyTorch Lightning hook — the framework enforces this signature contract. Changing it breaks the training loop.",
+  reads_config:        "This node reads a config key — renaming or removing the key causes a silent None return or KeyError.",
+  writes_config:       "This node writes a config value — changes affect all downstream readers of this key.",
+  named_reference:     "String or docstring reference — won't break at runtime but becomes stale documentation on rename.",
+  imports:             "Import dependency — renaming or moving the source breaks this import.",
+  instantiates:        "This node creates an instance of the target class.",
+};
+
+function dismissWelcome() {
+  const overlay = document.getElementById('welcome-overlay');
+  overlay.style.animation = 'fadeOut 0.2s ease forwards';
+  setTimeout(() => overlay.classList.add('hidden'), 200);
+  // Add fade-out keyframe dynamically
+  if (!document.getElementById('fadeout-style')) {
+    const s = document.createElement('style');
+    s.id = 'fadeout-style';
+    s.textContent = '@keyframes fadeOut { to { opacity:0; } }';
+    document.head.appendChild(s);
+  }
+  // Pulse the consequence panel to draw attention after dismissal
+  setTimeout(() => {
+    const ta = document.getElementById('consequence-query');
+    ta.classList.add('pulse-hint');
+    ta.addEventListener('animationend', () => ta.classList.remove('pulse-hint'), { once: true });
+  }, 400);
+}
+
+function dismissAndQuery(queryText) {
+  dismissWelcome();
+  setTimeout(() => {
+    const ta = document.getElementById('consequence-query');
+    ta.value = queryText;
+    ta.dataset.anchorId = '';
+    runConsequence();
+  }, 300);
+}
+
+function fillQuery(text) {
+  const ta = document.getElementById('consequence-query');
+  ta.value = text;
+  ta.dataset.anchorId = '';
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  // Brief pulse on the button
+  const btn = document.getElementById('btn-consequence');
+  btn.style.background = '#2ea043';
+  setTimeout(() => btn.style.background = '', 600);
+}
+
+async function loadHotNodes() {
+  if (!allNodes.length) return;
+  // Score by in_degree + out_degree — most structurally central
+  const scored = allNodes
+    .filter(n => !n.id.startsWith('hook::') && !n.id.startsWith('config::') && !n.id.startsWith('tensor_contract::'))
+    .map(n => ({ ...n, score: (n.in_degree || 0) * 2 + (n.out_degree || 0) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6);
+
+  const container = document.getElementById('hot-nodes-list');
+  if (!container) return;
+
+  // Fetch severity for each via impact endpoint
+  const cards = await Promise.all(scored.map(async n => {
+    try {
+      const r = await fetch(`/api/impact/${encodeURIComponent(n.id)}?depth=1`);
+      const d = await r.json();
+      return { ...n, severity: d.severity || 'low', downstream: d.blast_radius?.downstream_count || 0 };
+    } catch { return { ...n, severity: 'low', downstream: 0 }; }
+  }));
+
+  const COLOR_MAP = { function:'#58a6ff', class:'#d2a8ff', module:'#3fb950', data_format:'#79c0ff', unknown:'#8b949e' };
+
+  container.innerHTML = cards.map(n => `
+    <div class="hot-node-card" onclick="selectNodeById('${_h(n.id)}')">
+      <div class="hot-node-dot" style="background:${_h(COLOR_MAP[n.type] || '#8b949e')}"></div>
+      <div class="hot-node-info">
+        <div class="hot-node-name">${_h(n.name)}</div>
+        <div class="hot-node-meta">${_h(n.type)} · ${_h(n.downstream)} downstream</div>
+      </div>
+      <span class="hot-node-sev hot-sev-${_h(n.severity)}">${_h(n.severity)}</span>
+    </div>`).join('');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+
+loadGraph().then(() => loadHotNodes());
 </script>
 </body>
 </html>"""
