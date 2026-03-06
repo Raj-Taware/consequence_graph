@@ -640,11 +640,11 @@ def _cq_extract_nodes(query: str, graph: KnowledgeGraph) -> list[str]:
         if _is_external_node(nid, data.get("file_path", "")):
             continue
         name = data.get("name", "")
-        if name and len(name) > 3 and name.lower() not in _NLP_STOPWORDS:
+        if name and len(name) > 2 and name.lower() not in _NLP_STOPWORDS:
             candidates.append((nid, name, data))
         parts = nid.split(".")
         for part in parts[-2:]:
-            if part and len(part) > 3 and part.lower() not in _NLP_STOPWORDS:
+            if part and len(part) > 2 and part.lower() not in _NLP_STOPWORDS:
                 candidates.append((nid, part, data))
 
     # Deduplicate (nid, name) pairs
