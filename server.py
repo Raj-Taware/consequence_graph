@@ -26,7 +26,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, Query  
+    from fastapi import FastAPI, HTTPException, Request, Query
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -1150,6 +1150,24 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   #btn-diff { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
   #btn-diff:hover { border-color: #58a6ff; color: #58a6ff; }
   #btn-reindex { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
+  #btn-view-toggle {
+    padding: 6px 12px; background: #0d2211; border: 1px solid #3fb950;
+    border-radius: 6px; color: #3fb950; font-size: 11px; cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  #btn-view-toggle:hover { background: #132d1a; }
+  #btn-view-toggle.full-mode {
+    background: #21262d; border-color: #30363d; color: #8b949e;
+  }
+
+  /* Focus-mode visibility — nodes/edges outside the ego network fade out */
+  .node.focus-hidden { opacity: 0.06; pointer-events: none; }
+  .node.focus-visible { opacity: 1; }
+  .link.focus-hidden { opacity: 0.04; }
+  .link.focus-visible { opacity: 0.8; }
+
+  /* Focus-mode context ring on ego node */
+  .node.ego-node circle { filter: drop-shadow(0 0 5px rgba(63,185,80,0.5)); }
   #stats-bar { font-size: 11px; color: #8b949e; margin-left: auto; }
 
   #main { display: flex; flex: 1; overflow: hidden; }
@@ -1516,6 +1534,7 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   <div id="search-results"></div>
   <button id="btn-diff" onclick="loadDiff()">⎇ Diff vs main</button>
   <button id="btn-reindex" onclick="reindex()">↺ Reindex</button>
+  <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">◎ Focus view</button>
   <span id="stats-bar">loading...</span>
 </div>
 
@@ -1617,6 +1636,8 @@ let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
 let currentZoom = 1;
 let zoomBehavior = null;
+let viewMode = 'focus';          // 'focus' | 'full'
+let visibleNodeIds = new Set();  // controls which nodes are shown in focus mode
 let W = 0, H = 0;
 
 async function loadGraph() {
@@ -1796,6 +1817,13 @@ function renderGraph() {
     .force('center', d3.forceCenter(W / 2, H / 2).strength(0.05))
     .force('collision', d3.forceCollide(d => Math.max(12, 6 + d.in_degree * 1.5)))
     .on('tick', ticked);
+
+  // Apply initial focus visibility after first tick so D3 has bound data
+  simulation.on('end.focus', () => {
+    visibleNodeIds = computeDefaultFocus();
+    applyFocusVisibility();
+    simulation.on('end.focus', null); // run once only
+  });
 }
 
 function ticked() {
@@ -1808,6 +1836,12 @@ function ticked() {
 async function selectNode(d) {
   selectedNodeId = d.id;
   document.getElementById('sidebar-title').textContent = d.name;
+
+  // Expand ego network around clicked node (2-hop in focus mode)
+  if (viewMode === 'focus') {
+    visibleNodeIds = computeEgoNetwork(d.id, 2);
+    applyFocusVisibility();
+  }
 
   // Wait one animation frame so simulation coordinates have settled
   requestAnimationFrame(() => flyToNode(d));
@@ -2297,6 +2331,104 @@ async function reindex() {
   document.getElementById('loading').textContent = 'Re-indexing...';
   await fetch('/api/reindex', { method: 'POST' });
   location.reload();
+}
+
+// ── Ego network / focus view ──────────────────────────────────────────────────
+
+/**
+ * Returns the Set of node IDs within `hops` of any seed node.
+ * Seeds can be one node ID (string) or an array of IDs.
+ */
+function computeEgoNetwork(seeds, hops = 1) {
+  const seedArr = Array.isArray(seeds) ? seeds : [seeds];
+  const visible = new Set(seedArr);
+
+  // Build adjacency — bidirectional so ego network is symmetric
+  const adj = {};
+  allNodes.forEach(n => { adj[n.id] = new Set(); });
+  allEdges.forEach(e => {
+    const s = typeof e.source === 'object' ? e.source.id : e.source;
+    const t = typeof e.target === 'object' ? e.target.id : e.target;
+    if (adj[s]) adj[s].add(t);
+    if (adj[t]) adj[t].add(s);
+  });
+
+  let frontier = new Set(seedArr);
+  for (let h = 0; h < hops; h++) {
+    const next = new Set();
+    frontier.forEach(id => {
+      (adj[id] || new Set()).forEach(nb => {
+        if (!visible.has(nb)) { visible.add(nb); next.add(nb); }
+      });
+    });
+    frontier = next;
+  }
+  return visible;
+}
+
+/** Compute the default focus: top N hubs + their 1-hop neighbours */
+function computeDefaultFocus(n = 7) {
+  const hubs = [...allNodes]
+    .sort((a, b) => ((b.in_degree || 0) + (b.out_degree || 0)) - ((a.in_degree || 0) + (a.out_degree || 0)))
+    .slice(0, n)
+    .map(n => n.id);
+  return computeEgoNetwork(hubs, 1);
+}
+
+/** Apply focus visibility to D3 node/link selections */
+function applyFocusVisibility() {
+  if (!nodeEl || !linkEl) return;
+
+  if (viewMode === 'full') {
+    nodeEl.classed('focus-hidden', false).classed('focus-visible', true).classed('ego-node', false);
+    linkEl.classed('focus-hidden', false).classed('focus-visible', true);
+    return;
+  }
+
+  // focus mode
+  nodeEl
+    .classed('focus-visible', d => visibleNodeIds.has(d.id))
+    .classed('focus-hidden',  d => !visibleNodeIds.has(d.id))
+    .classed('ego-node',      d => d.id === selectedNodeId);
+
+  linkEl.classed('focus-visible', d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return visibleNodeIds.has(s) && visibleNodeIds.has(t);
+  }).classed('focus-hidden', d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return !visibleNodeIds.has(s) || !visibleNodeIds.has(t);
+  });
+
+  updateStatsBar();
+}
+
+function updateStatsBar() {
+  const total = allNodes.length;
+  const shown = viewMode === 'full' ? total : visibleNodeIds.size;
+  const btn = document.getElementById('btn-view-toggle');
+  if (viewMode === 'focus') {
+    document.getElementById('stats-bar').textContent =
+      `Showing ${shown} of ${total} nodes · ${allEdges.length} edges`;
+    btn.textContent = '◎ Focus view';
+    btn.classList.remove('full-mode');
+  } else {
+    document.getElementById('stats-bar').textContent =
+      `${total} nodes · ${allEdges.length} edges (full graph)`;
+    btn.textContent = '⊞ Full graph';
+    btn.classList.add('full-mode');
+  }
+}
+
+function toggleViewMode() {
+  viewMode = viewMode === 'focus' ? 'full' : 'focus';
+  if (viewMode === 'focus' && selectedNodeId) {
+    visibleNodeIds = computeEgoNetwork(selectedNodeId, 2);
+  } else if (viewMode === 'focus') {
+    visibleNodeIds = computeDefaultFocus();
+  }
+  applyFocusVisibility();
 }
 
 // ── Onboarding ────────────────────────────────────────────────────────────────
