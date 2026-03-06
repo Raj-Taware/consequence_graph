@@ -212,7 +212,47 @@ def api_stats():
     return get_graph().stats()
 
 
-@app.post("/api/reindex")
+@app.get("/api/debug/node/{node_name}")
+def api_debug_node(node_name: str):
+    """Temporary: trace what happens to a node name through the resolution pipeline."""
+    graph = get_graph()
+    engine = get_engine()
+
+    # 1. What nodes exist with this name?
+    matching = [(nid, data) for nid, data in graph.g.nodes(data=True)
+                if data.get("name", "").lower() == node_name.lower()
+                or nid.lower() == node_name.lower()
+                or nid.lower().endswith(f"::{node_name.lower()}")
+                or nid.lower().endswith(f".{node_name.lower()}")]
+
+    # 2. What does _cq_extract_nodes return?
+    from server import _cq_extract_nodes
+    extracted = _cq_extract_nodes(node_name, graph)
+
+    results = {}
+    for nid, data in matching[:5]:
+        up = graph.upstream(nid, depth=3)
+        dn = graph.downstream(nid, depth=3)
+        impact = engine.impact(nid, depth=3)
+        results[nid] = {
+            "node_type": data.get("node_type"),
+            "name": data.get("name"),
+            "upstream_count": len(up),
+            "downstream_count": len(dn),
+            "upstream_sample": [e["node"] for e in up[:3]],
+            "downstream_sample": [e["node"] for e in dn[:3]],
+            "engine_impact_error": impact.get("error") or impact.get("ambiguous"),
+            "engine_impact_downstream": impact.get("blast_radius", {}).get("downstream_count", "N/A"),
+        }
+
+    return {
+        "query": node_name,
+        "extracted_by_cq": extracted,
+        "matching_nodes": results,
+    }
+
+
+
 def api_reindex():
     if PRODUCTION:
         raise HTTPException(status_code=403, detail="Reindex disabled in production demo.")
@@ -260,14 +300,61 @@ async def api_consequence(request: Request):
     change_type = _cq_classify_change_type(query_text)
 
     # 3. Compute blast radius per mentioned node
+    # engine.impact() excludes config::, hook::, tensor_contract:: nodes from resolution.
+    # For those, fall back to direct graph traversal so comparison queries on config nodes work.
+    _SYNTHETIC_PREFIXES = ("config::", "hook::", "tensor_contract::", "data_format::")
     impacts = {}
     for nid in mentioned:
         r = engine.impact(nid, depth=3)
         if "error" not in r and "ambiguous" not in r:
             impacts[nid] = r
+        elif graph.has_node(nid) and any(nid.startswith(p) for p in _SYNTHETIC_PREFIXES):
+            # Direct traversal fallback for synthetic nodes.
+            # Config nodes are LEAF nodes — edges go function→config::key, never the reverse.
+            # So "downstream" for a config key = all functions that read/write it = upstream().
+            # We swap: use upstream for the "what does this affect" count on config nodes.
+            node_data = graph.get_node(nid) or {}
+            readers_raw  = graph.upstream(nid, depth=3)   # functions that use this config key
+            writers_raw  = graph.downstream(nid, depth=3) # typically empty for config nodes
+            all_raw = readers_raw + writers_raw
+            score = len(all_raw)
+            impacts[nid] = {
+                "target": nid,
+                "target_meta": {
+                    "type": node_data.get("node_type"),
+                    "file": node_data.get("file_path", ""),
+                    "line": node_data.get("line_no", 0),
+                    "is_lightning_hook": False,
+                    "tensor_shapes": {},
+                    "config_keys": [],
+                },
+                "severity": "medium" if score > 5 else "low",
+                "severity_score": score,
+                "blast_radius": {
+                    "upstream":          readers_raw,
+                    "downstream":        readers_raw,  # expose readers as "downstream" so comparison logic finds them
+                    "upstream_count":    len(readers_raw),
+                    "downstream_count":  len(readers_raw),
+                },
+                "critical_path": [],
+                "llm_context_hint": "",
+            }
 
     if not impacts:
         return {"error": "Could not compute impact for any mentioned nodes.", "mentioned": mentioned}
+
+    # 3b. Post-process: config nodes are leaf nodes (edges go function→config::key,
+    # never config→function). engine.impact() resolves them via exact match but returns
+    # downstream_count=0 because they have no successors. For these nodes, the upstream
+    # (functions that read/write the key) IS the blast radius — swap it in.
+    _SYNTHETIC_PREFIXES = ("config::", "hook::", "tensor_contract::", "data_format::")
+    for nid, impact in impacts.items():
+        if any(nid.startswith(p) for p in _SYNTHETIC_PREFIXES):
+            br = impact.get("blast_radius", {})
+            if br.get("downstream_count", 0) == 0 and br.get("upstream_count", 0) > 0:
+                readers = br.get("upstream", [])
+                impact["blast_radius"]["downstream"]       = readers
+                impact["blast_radius"]["downstream_count"] = len(readers)
 
     # 4. Score all nodes by structural relevance
     intersection_scores: dict = {}
@@ -823,6 +910,35 @@ def _cq_build_lead(
                 "severity": impact.get("severity", "low"),
             })
         options.sort(key=lambda x: x["downstream_count"])
+
+        # Fallback: if EXECUTABLE_TYPES filter left nothing (e.g. both nodes are
+        # config or data_format type — still valid to compare peers of the same type),
+        # build options from all mentioned nodes that have impact data.
+        # NOTE: do NOT filter out config:: nodes from downstream here — when comparing
+        # config nodes against each other, their config-typed connections ARE the signal.
+        if not options:
+            mentioned_prefixes = tuple(
+                nid.split("::")[0] + "::" for nid in mentioned if "::" in nid
+            )
+            for nid in mentioned:
+                if nid not in impacts:
+                    continue
+                node_data_m = graph.get_node(nid) or {}
+                if _is_external_node(nid, node_data_m.get("file_path", "")):
+                    continue
+                br = impacts[nid].get("blast_radius", {})
+                downstream = [
+                    e for e in br.get("downstream", [])
+                    if not e["node"].startswith(("hook::", "tensor_contract::"))
+                    and not _is_external_node(e["node"], e.get("file_path", ""))
+                ]
+                options.append({
+                    "node":  nid,
+                    "name":  node_data_m.get("name", nid.split(".")[-1]),
+                    "downstream_count": len(downstream),
+                    "severity": impacts[nid].get("severity", "low"),
+                })
+            options.sort(key=lambda x: x["downstream_count"])
 
         # Bug 2 fix: deduplicate by name — polymorphic implementations of the same
         # method are NOT valid alternatives to compare (self-referential comparison).
@@ -1382,6 +1498,15 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .verdict-delta strong { color: #8b949e; }
 
   /* Breakdown toggle for decision intent */
+  /* Back to explorer button */
+  .back-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; color: #6e7681; background: none; border: none;
+    cursor: pointer; padding: 0 0 12px 0; font-family: inherit;
+    transition: color 0.12s; letter-spacing: 0.02em;
+  }
+  .back-btn:hover { color: #8b949e; }
+
   .breakdown-toggle {
     font-size: 10px; color: #6e7681; background: none; border: none;
     cursor: pointer; padding: 6px 0 2px 0; display: block;
@@ -2218,7 +2343,8 @@ function renderConsequenceSidebar(data) {
 
   if (hasTiers) {
     if (isDecision) {
-      html += `<button class="breakdown-toggle" onclick="toggleBreakdown(this)">▸ See full node breakdown (${(data.will_break?.length||0) + (data.likely_need?.length||0) + (data.be_aware?.length||0)} nodes)</button>
+      const _breakdownTotal = (data.will_break?.length||0) + (data.likely_need?.length||0) + (data.be_aware?.length||0);
+      html += `<button class="breakdown-toggle" data-total="${_breakdownTotal}" onclick="toggleBreakdown(this)">▸ See full node breakdown (${_breakdownTotal} nodes)</button>
       <div class="breakdown-section">`;
     }
 
@@ -2264,6 +2390,8 @@ function renderConsequenceSidebar(data) {
   }
 
   document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
+  // Prepend a back button so user can return to the graph explorer view
+  html = `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>` + html;
   document.getElementById('sidebar-content').innerHTML = html;
 }
 
@@ -2334,10 +2462,35 @@ function toggleBreakdown(btn) {
   const section = btn.nextElementSibling;
   const isOpen = section.classList.toggle('open');
   btn.classList.toggle('open', isOpen);
-  const total = btn.textContent.match(/\d+/)?.[0] || '';
+  const total = btn.dataset.total || '';
   btn.textContent = isOpen
     ? `▾ Hide node breakdown`
     : `▸ See full node breakdown (${total} nodes)`;
+}
+
+function backToExplore() {
+  document.getElementById('sidebar-title').textContent = 'Start exploring';
+  const content = document.getElementById('sidebar-content');
+  content.innerHTML = `
+    <div class="sidebar-intro">
+      <strong>Two ways to explore:</strong><br>
+      Click any node in the graph to see what it affects — or describe a change in the panel below and get a ranked consequence breakdown.
+    </div>
+    <div class="hot-nodes-section">
+      <div class="hot-nodes-label">Most structurally central nodes</div>
+      <div id="hot-nodes-list"><div style="color:#6e7681;font-size:11px">Loading...</div></div>
+    </div>`;
+  selectedNodeId = null;
+  // Restore default focus view
+  if (viewMode === 'focus') {
+    visibleNodeIds = computeDefaultFocus();
+    applyFocusVisibility();
+  }
+  // Reload hot nodes
+  loadHotNodes();
+  // Clear graph highlights
+  if (nodeEl) nodeEl.classed('dimmed', false).classed('highlighted', false);
+  if (linkEl) linkEl.classed('dimmed', false);
 }
 
 function highlightConsequenceNodes(data) {
