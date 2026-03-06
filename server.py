@@ -26,7 +26,7 @@ from core.query import QueryEngine
 from output.llm_context import format_impact_as_context
 
 try:
-    from fastapi import FastAPI, HTTPException, Request,Query 
+    from fastapi import FastAPI, HTTPException, Request, Query  
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
@@ -1221,24 +1221,99 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   #btn-consequence:hover { background:#2ea043; }
   #btn-consequence:disabled { background:#1a3020; color:#3d6b45; cursor:not-allowed; }
 
-  /* ── Consequence result tiers ───────────────────────────── */
-  .tier-section { margin-top:14px; }
-  .tier-header { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
-  .tier-badge { font-size:9px; font-weight:700; padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.08em; }
-  .tier-will  { background:#3b0f0f; color:#f85149; }
-  .tier-likely{ background:#2d1f03; color:#e3b341; }
-  .tier-aware { background:#131d2e; color:#8b949e; }
-  .tier-count { font-size:10px; color:#6e7681; }
+  /* ── Consequence result tiers — redesigned ─────────────── */
+  .tier-section { margin-top: 16px; }
+  .tier-header {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 7px; padding-bottom: 6px;
+    border-bottom: 1px solid #21262d;
+  }
+  .tier-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; }
+  .tier-label.t1 { color: #f85149; }
+  .tier-label.t2 { color: #e3b341; }
+  .tier-label.t3 { color: #6e7681; }
+  .tier-action { font-size:10px; color:#6e7681; margin-left:auto; }
+  .tier-action.t1 { color:#f85149; opacity:0.7; }
 
-  .cq-node { padding:9px 11px; margin-bottom:6px; border-radius:6px; background:#0d1117; border:1px solid #21262d; cursor:pointer; transition: border-color 0.15s; }
-  .cq-node:hover { border-color:#30363d; }
-  .cq-node.tier-1 { border-left:3px solid #f85149; }
-  .cq-node.tier-2 { border-left:3px solid #e3b341; }
-  .cq-node.tier-3 { border-left:3px solid #30363d; }
-  .cq-node .cq-name { font-size:12px; font-weight:600; color:#e6edf3; display:flex; align-items:center; gap:6px; }
-  .cq-node .cq-meta { font-size:10px; color:#6e7681; margin-top:2px; }
-  .cq-node .cq-consequence { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; padding-top:6px; border-top:1px solid #21262d; }
-  .cq-edge-badge { font-size:9px; padding:1px 5px; background:#21262d; border-radius:3px; color:#8b949e; font-weight:400; }
+  /* Cards */
+  .cq-node {
+    margin-bottom: 5px; border-radius: 7px;
+    background: #0d1117; border: 1px solid #21262d;
+    cursor: pointer; transition: border-color 0.12s; overflow: hidden;
+  }
+  .cq-node:hover { border-color: #30363d; }
+  .cq-node.tier-1 { border-left: 3px solid #f85149; }
+  .cq-node.tier-2 { border-left: 3px solid #e3b341; }
+  .cq-node.tier-3 { border-left: 3px solid #30363d; opacity: 0.82; }
+
+  /* Row 1 — name + dot + pill */
+  .cq-header { display:flex; align-items:center; gap:8px; padding:9px 11px 0 11px; }
+  .cq-sev-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; margin-top:1px; }
+  .cq-name {
+    font-size:12px; font-weight:600; color:#e6edf3;
+    flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .cq-tier-pill {
+    font-size:8px; font-weight:700; padding:1px 6px; border-radius:8px;
+    text-transform:uppercase; letter-spacing:0.08em; flex-shrink:0;
+  }
+  .cq-pill-1 { background:#3b0f0f; color:#f85149; }
+  .cq-pill-2 { background:#2d1f03; color:#e3b341; }
+  .cq-pill-3 { background:#1a1f2e; color:#6e7681; }
+
+  /* Row 2 — consequence sentence, always visible, primary */
+  .cq-consequence {
+    font-size:11px; color:#c9d1d9; line-height:1.65;
+    padding: 5px 11px 0 26px;
+  }
+  .cq-no-consequence { font-size:11px; color:#6e7681; font-style:italic; padding:4px 11px 0 26px; }
+
+  /* Expand toggle */
+  .cq-expand-btn {
+    font-size:9px; color:#6e7681; background:none; border:none;
+    cursor:pointer; padding:5px 11px 7px 26px; display:block;
+    width:100%; text-align:left; font-family:inherit; transition:color 0.12s;
+  }
+  .cq-expand-btn:hover { color:#8b949e; }
+  .cq-node.expanded .cq-expand-btn { color:#58a6ff; }
+
+  /* Row 3 — metadata, collapsed by default */
+  .cq-detail {
+    display:none; padding:7px 11px 9px 26px;
+    border-top:1px solid #161b22; margin-top:2px;
+  }
+  .cq-node.expanded .cq-detail { display:block; }
+  .cq-meta-row { display:flex; flex-wrap:wrap; gap:5px; align-items:center; }
+  .cq-meta-item { font-size:10px; color:#6e7681; }
+  .cq-meta-item.file { color:#8b949e; font-family:'SF Mono',monospace; font-size:10px; }
+  .cq-badge {
+    font-size:9px; padding:1px 5px; background:#161b22; border:1px solid #21262d;
+    border-radius:3px; color:#8b949e; position:relative; cursor:default;
+  }
+  .cq-badge.hook-badge { color:#f0883e; border-color:#2a1a0e; }
+  .cq-badge.shape-badge { color:#d2a8ff; border-color:#1f1a2e; }
+  .cq-badge .badge-tip {
+    display:none; position:absolute; bottom:calc(100% + 6px); left:0;
+    width:200px; padding:7px 10px; background:#1c2128; border:1px solid #30363d;
+    border-radius:6px; font-size:10px; color:#c9d1d9; line-height:1.5;
+    z-index:200; pointer-events:none; white-space:normal;
+  }
+  .cq-badge:hover .badge-tip { display:block; }
+
+  /* legacy badge — kept for other code paths */
+  .cq-edge-badge { font-size:9px; padding:1px 5px; background:#21262d; border-radius:3px; color:#8b949e; font-weight:400; position:relative; }
+  .cq-edge-badge .edge-tooltip {
+    display:none; position:absolute; bottom:calc(100% + 6px); left:50%;
+    transform:translateX(-50%); width:180px; padding:7px 10px;
+    background:#1c2128; border:1px solid #30363d; border-radius:6px;
+    font-size:10px; color:#c9d1d9; line-height:1.5; z-index:200;
+    pointer-events:none; white-space:normal;
+  }
+  .cq-edge-badge .edge-tooltip::after {
+    content:''; position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    border:5px solid transparent; border-top-color:#30363d;
+  }
+  .cq-edge-badge:hover .edge-tooltip { display:block; }
 
   /* ── Lead card ──────────────────────────────────────────── */
   .lead-card { background:#0d1117; border:1px solid #30363d; border-radius:7px; padding:12px 14px; margin-bottom:14px; }
@@ -2019,8 +2094,9 @@ function renderConsequenceSidebar(data) {
   if (data.will_break && data.will_break.length) {
     html += `<div class="tier-section">
       <div class="tier-header">
-        <span class="tier-badge tier-will">🔴 Will break</span>
-        <span class="tier-count">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''} — must address</span>
+        <span class="tier-label t1">Will break</span>
+        <span style="font-size:10px;color:#f85149;opacity:.6">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''}</span>
+        <span class="tier-action t1">must address</span>
       </div>`;
     data.will_break.forEach(n => { html += renderCqNode(n, 1); });
     html += `</div>`;
@@ -2030,8 +2106,9 @@ function renderConsequenceSidebar(data) {
   if (data.likely_need && data.likely_need.length) {
     html += `<div class="tier-section">
       <div class="tier-header">
-        <span class="tier-badge tier-likely">🟡 Likely need</span>
-        <span class="tier-count">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''} — verify before shipping</span>
+        <span class="tier-label t2">Likely need</span>
+        <span style="font-size:10px;color:#6e7681">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''}</span>
+        <span class="tier-action">verify before shipping</span>
       </div>`;
     data.likely_need.forEach(n => { html += renderCqNode(n, 2); });
     html += `</div>`;
@@ -2041,8 +2118,9 @@ function renderConsequenceSidebar(data) {
   if (data.be_aware && data.be_aware.length) {
     html += `<div class="tier-section">
       <div class="tier-header">
-        <span class="tier-badge tier-aware">⚪ Be aware</span>
-        <span class="tier-count">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''} — in blast radius, likely safe</span>
+        <span class="tier-label t3">Be aware</span>
+        <span style="font-size:10px;color:#6e7681">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''}</span>
+        <span class="tier-action">in blast radius</span>
       </div>`;
     data.be_aware.forEach(n => { html += renderCqNode(n, 3); });
     html += `</div>`;
@@ -2055,29 +2133,64 @@ function renderConsequenceSidebar(data) {
 function renderCqNode(n, tier) {
   const fname  = (n.file || '').split(/[/\\]/).pop();
   const loc    = fname ? `${_h(fname)}${n.line ? ':' + _h(n.line) : ''}` : '';
-  const edgeTypes = (n.edge_types || []).slice(0, 2);
+  const edgeTypes = (n.edge_types || []).slice(0, 3);
   const via    = (n.via || []).map(_h).join(', ');
+
+  // Consequence sentence — escape first, then substitute backtick→<code>
   const consequence = _h(n.consequence || '').replace(
     /`([^`]+)`/g,
     '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff;font-size:10px">$1</code>'
   );
-  const hookBadge = n.is_hook ? '<span class="cq-edge-badge" style="color:#f0883e">hook<span class="edge-tooltip">PyTorch Lightning hook — the framework enforces this signature contract.</span></span>' : '';
+
+  // Severity dot colour per tier
+  const dotColor = tier === 1 ? '#f85149' : tier === 2 ? '#e3b341' : '#6e7681';
+  const pillLabel = tier === 1 ? 'breaks' : tier === 2 ? 'check' : 'aware';
+
+  // Badges for detail row
+  const hookBadge = n.is_hook
+    ? `<span class="cq-badge hook-badge">⚡ hook<span class="badge-tip">PyTorch Lightning hook — the framework enforces this signature contract at runtime.</span></span>`
+    : '';
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
-    ? `<span class="cq-edge-badge">shapes<span class="edge-tooltip">This node has known tensor shape contracts.</span></span>` : '';
+    ? `<span class="cq-badge shape-badge">shapes<span class="badge-tip">This node has known tensor shape contracts.</span></span>`
+    : '';
   const edgeBadges = edgeTypes.map(et => {
     const tip = EDGE_TOOLTIP_TEXT[et] || '';
-    return `<span class="cq-edge-badge">${_h(et)}${tip ? `<span class="edge-tooltip">${_h(tip)}</span>` : ''}</span>`;
+    return `<span class="cq-badge">${_h(et)}${tip ? `<span class="badge-tip">${_h(tip)}</span>` : ''}</span>`;
   }).join('');
 
-  return `<div class="cq-node tier-${_h(tier)}" onclick="selectNodeById('${_h(n.node)}')">
-    <div class="cq-name">
-      ${_h(n.name)}
-      ${hookBadge}${shapesBadge}
-      ${edgeBadges}
+  const hasDetail = loc || via || hookBadge || shapesBadge || edgeBadges;
+  const blastNote = n.intersection_count > 1
+    ? `<span class="cq-meta-item">· ${_h(n.intersection_count)} blast radii</span>` : '';
+  const viaNote = via
+    ? `<span class="cq-meta-item">via ${via}</span>` : '';
+
+  return `<div class="cq-node tier-${_h(tier)}" id="cqnode-${_h(n.node.replace(/[^a-z0-9]/gi,'_'))}">
+    <div class="cq-header" onclick="selectNodeById('${_h(n.node)}')">
+      <div class="cq-sev-dot" style="background:${dotColor}"></div>
+      <div class="cq-name">${_h(n.name)}</div>
+      <span class="cq-tier-pill cq-pill-${_h(tier)}">${pillLabel}</span>
     </div>
-    <div class="cq-meta">${loc}${via ? ` · via ${via}` : ''}${n.intersection_count > 1 ? ` · ${_h(n.intersection_count)} blast radii` : ''}</div>
-    ${consequence ? `<div class="cq-consequence">${consequence}</div>` : ''}
+    ${consequence
+      ? `<div class="cq-consequence">${consequence}</div>`
+      : `<div class="cq-no-consequence">No specific consequence modelled for this change type.</div>`
+    }
+    ${hasDetail ? `
+    <button class="cq-expand-btn" onclick="toggleCqDetail(this, event)">▸ ${loc || 'details'}</button>
+    <div class="cq-detail">
+      <div class="cq-meta-row">
+        ${loc ? `<span class="cq-meta-item file">${loc}</span>` : ''}
+        ${viaNote}${blastNote}
+        ${hookBadge}${shapesBadge}${edgeBadges}
+      </div>
+    </div>` : ''}
   </div>`;
+}
+
+function toggleCqDetail(btn, e) {
+  e.stopPropagation(); // don't fire selectNodeById on the parent
+  const card = btn.closest('.cq-node');
+  const isExpanded = card.classList.toggle('expanded');
+  btn.textContent = (isExpanded ? '▾ ' : '▸ ') + (btn.textContent.slice(2));
 }
 
 function highlightConsequenceNodes(data) {
