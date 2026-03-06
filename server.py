@@ -1339,6 +1339,59 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .lead-card .lead-summary { font-size:12px; color:#c9d1d9; line-height:1.65; }
   .lead-card .lead-rec { font-size:12px; color:#3fb950; line-height:1.6; margin-top:6px; font-weight:600; }
 
+  /* ── Comparison verdict (decision intent) ───────────────── */
+  .verdict-card {
+    background: #0d1117; border: 1px solid #30363d; border-radius:8px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .verdict-winner {
+    font-size: 13px; font-weight: 700; color: #3fb950;
+    margin-bottom: 12px; line-height: 1.5;
+  }
+  .verdict-winner code {
+    background: #0d2211; padding: 1px 6px; border-radius: 4px;
+    color: #3fb950; font-size: 12px;
+  }
+  .verdict-bars { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .verdict-bar-row { display: flex; align-items: center; gap: 8px; }
+  .verdict-bar-label {
+    font-size: 11px; font-weight: 600; color: #e6edf3;
+    width: 110px; flex-shrink: 0; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .verdict-bar-track {
+    flex: 1; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden;
+  }
+  .verdict-bar-fill {
+    height: 100%; border-radius: 4px;
+    transition: width 0.6s cubic-bezier(0.4,0,0.2,1);
+  }
+  .verdict-bar-fill.winner { background: #3fb950; }
+  .verdict-bar-fill.loser  { background: #f85149; }
+  .verdict-bar-count {
+    font-size: 10px; color: #8b949e; width: 36px;
+    text-align: right; flex-shrink: 0;
+  }
+  .verdict-bar-count.winner { color: #3fb950; font-weight: 700; }
+  .verdict-bar-count.loser  { color: #f85149; }
+
+  .verdict-delta {
+    font-size: 10px; color: #6e7681; line-height: 1.6;
+    padding-top: 10px; border-top: 1px solid #21262d;
+  }
+  .verdict-delta strong { color: #8b949e; }
+
+  /* Breakdown toggle for decision intent */
+  .breakdown-toggle {
+    font-size: 10px; color: #6e7681; background: none; border: none;
+    cursor: pointer; padding: 6px 0 2px 0; display: block;
+    font-family: inherit; transition: color 0.12s; text-align: left;
+  }
+  .breakdown-toggle:hover { color: #8b949e; }
+  .breakdown-toggle.open { color: #58a6ff; }
+  .breakdown-section { display: none; }
+  .breakdown-section.open { display: block; }
+
   .step-list { margin-top:8px; }
   .step-row { display:flex; gap:10px; padding:7px 0; border-bottom:1px solid #21262d; cursor:pointer; }
   .step-row:last-child { border-bottom:none; }
@@ -2025,66 +2078,101 @@ function renderConsequenceSidebar(data) {
 
   // ── Lead card — adaptive per intent ────────────────────────
   const lead = data.lead || {};
-  html += `<div class="lead-card">`;
 
   if (lead.format === 'decision') {
-    html += `<div class="lead-type">Decision analysis</div>`;
-    if (lead.recommendation) {
-      html += `<div class="lead-rec">→ ${lead.recommendation}</div>`;
-    }
-    if (lead.options && lead.options.length) {
-      const sorted = [...lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
-      html += `<div style="margin-top:10px">`;
-      sorted.forEach((opt, i) => {
-        const cheaper = i === 0;
-        html += `<div class="option-row">
-          <span class="option-name">${opt.name}</span>
-          <span class="option-cost ${cheaper ? 'cheaper' : ''}">${opt.downstream_count} downstream${cheaper ? ' ✓ cheaper' : ''}</span>
-        </div>`;
-      });
-      html += `</div>`;
-    }
+    // ── Comparison verdict — the answer first, evidence second ──
+    const sorted = [...(lead.options || [])].sort((a,b) => a.downstream_count - b.downstream_count);
 
-  } else if (lead.format === 'removal_plan') {
-    html += `<div class="lead-type">Removal — cleanup order</div>
-      <div class="lead-summary">${lead.summary}</div>`;
-    if (lead.ordered_steps && lead.ordered_steps.length) {
-      html += `<div class="step-list">`;
-      lead.ordered_steps.forEach(s => {
-        html += `<div class="step-row" onclick="selectNodeById('${s.node}')">
-          <div class="step-num">${s.step}</div>
-          <div>
-            <div class="step-name">${s.name}</div>
-            <div class="step-action">${s.action}</div>
+    // Recommendation sentence — replace backtick-code spans
+    const recHtml = (lead.recommendation || '').replace(
+      /`([^`]+)`/g,
+      '<code>$1</code>'
+    );
+
+    if (sorted.length === 0) {
+      html += `<div class="verdict-card"><div class="verdict-winner">${recHtml}</div></div>`;
+    } else {
+      const maxCount = Math.max(...sorted.map(o => o.downstream_count), 1);
+      const winner = sorted[0];
+      const loser  = sorted[sorted.length - 1];
+      const diff   = loser.downstream_count - winner.downstream_count;
+
+      // Build bar rows
+      const barRows = sorted.map((opt, i) => {
+        const isWinner = i === 0;
+        const pct = Math.round((opt.downstream_count / maxCount) * 100);
+        return `<div class="verdict-bar-row">
+          <div class="verdict-bar-label">${_h(opt.name)}</div>
+          <div class="verdict-bar-track">
+            <div class="verdict-bar-fill ${isWinner ? 'winner' : 'loser'}"
+                 style="width:${pct || 4}%"></div>
+          </div>
+          <div class="verdict-bar-count ${isWinner ? 'winner' : 'loser'}">
+            ${_h(opt.downstream_count)} node${opt.downstream_count !== 1 ? 's' : ''}
           </div>
         </div>`;
-      });
-      html += `</div>`;
-    }
+      }).join('');
 
-  } else if (lead.format === 'step_by_step') {
-    html += `<div class="lead-type">Implementation plan</div>
-      <div class="lead-summary">${lead.summary}</div>`;
-    if (lead.steps && lead.steps.length) {
-      html += `<div class="step-list">`;
-      lead.steps.forEach(s => {
-        html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${s.node}')"` : ''}>
-          <div class="step-num">${s.step}</div>
-          <div>
-            <div class="step-name">${s.name}</div>
-            <div class="step-action">${s.action}</div>
-          </div>
-        </div>`;
-      });
-      html += `</div>`;
+      html += `<div class="verdict-card">
+        <div class="verdict-winner">${recHtml}</div>
+        <div class="verdict-bars">${barRows}</div>
+        ${diff > 0 ? `<div class="verdict-delta">
+          Modifying <strong>${_h(winner.name)}</strong> cascades into
+          <strong>${diff} fewer node${diff !== 1 ? 's' : ''}</strong> than
+          <strong>${_h(loser.name)}</strong>.
+          Structural cost ratio: ${winner.downstream_count}:${loser.downstream_count}.
+        </div>` : ''}
+      </div>`;
     }
 
   } else {
-    // exploration
-    html += `<div class="lead-type">Structural overview</div>
-      <div class="lead-summary">${(lead.summary || '').replace(/`([^`]+)`/g, '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff">$1</code>')}</div>`;
+    // All non-decision intents keep the lead-card format
+    html += `<div class="lead-card">`;
+
+    if (lead.format === 'removal_plan') {
+      html += `<div class="lead-type">Removal — cleanup order</div>
+        <div class="lead-summary">${_h(lead.summary || '')}</div>`;
+      if (lead.ordered_steps && lead.ordered_steps.length) {
+        html += `<div class="step-list">`;
+        lead.ordered_steps.forEach(s => {
+          html += `<div class="step-row" onclick="selectNodeById('${_h(s.node)}')">
+            <div class="step-num">${_h(s.step)}</div>
+            <div>
+              <div class="step-name">${_h(s.name)}</div>
+              <div class="step-action">${_h(s.action)}</div>
+            </div>
+          </div>`;
+        });
+        html += `</div>`;
+      }
+    } else if (lead.format === 'step_by_step') {
+      html += `<div class="lead-type">Implementation plan</div>
+        <div class="lead-summary">${_h(lead.summary || '')}</div>`;
+      if (lead.steps && lead.steps.length) {
+        html += `<div class="step-list">`;
+        lead.steps.forEach(s => {
+          html += `<div class="step-row" ${s.node ? `onclick="selectNodeById('${_h(s.node)}')"` : ''}>
+            <div class="step-num">${_h(s.step)}</div>
+            <div>
+              <div class="step-name">${_h(s.name)}</div>
+              <div class="step-action">${_h(s.action)}</div>
+            </div>
+          </div>`;
+        });
+        html += `</div>`;
+      }
+    } else {
+      // exploration
+      const summaryHtml = _h(lead.summary || '').replace(
+        /`([^`]+)`/g,
+        '<code style="background:#21262d;padding:1px 4px;border-radius:3px;color:#79c0ff">$1</code>'
+      );
+      html += `<div class="lead-type">Structural overview</div>
+        <div class="lead-summary">${summaryHtml}</div>`;
+    }
+
+    html += `</div>`; // close .lead-card
   }
-  html += `</div>`;
 
   // ── Nodes anchored in query ─────────────────────────────────
   if (data.mentioned_details && data.mentioned_details.length) {
@@ -2124,40 +2212,55 @@ function renderConsequenceSidebar(data) {
     html += `</div>`;
   }
 
-  // ── Tier 1: will break ──────────────────────────────────────
-  if (data.will_break && data.will_break.length) {
-    html += `<div class="tier-section">
-      <div class="tier-header">
-        <span class="tier-label t1">Will break</span>
-        <span style="font-size:10px;color:#f85149;opacity:.6">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''}</span>
-        <span class="tier-action t1">must address</span>
-      </div>`;
-    data.will_break.forEach(n => { html += renderCqNode(n, 1); });
-    html += `</div>`;
-  }
+  // ── Tier sections — collapsed for decision, normal for others ──
+  const hasTiers = (data.will_break?.length || data.likely_need?.length || data.be_aware?.length);
+  const isDecision = data.intent === 'decision';
 
-  // ── Tier 2: likely need ─────────────────────────────────────
-  if (data.likely_need && data.likely_need.length) {
-    html += `<div class="tier-section">
-      <div class="tier-header">
-        <span class="tier-label t2">Likely need</span>
-        <span style="font-size:10px;color:#6e7681">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''}</span>
-        <span class="tier-action">verify before shipping</span>
-      </div>`;
-    data.likely_need.forEach(n => { html += renderCqNode(n, 2); });
-    html += `</div>`;
-  }
+  if (hasTiers) {
+    if (isDecision) {
+      html += `<button class="breakdown-toggle" onclick="toggleBreakdown(this)">▸ See full node breakdown (${(data.will_break?.length||0) + (data.likely_need?.length||0) + (data.be_aware?.length||0)} nodes)</button>
+      <div class="breakdown-section">`;
+    }
 
-  // ── Tier 3: be aware ────────────────────────────────────────
-  if (data.be_aware && data.be_aware.length) {
-    html += `<div class="tier-section">
-      <div class="tier-header">
-        <span class="tier-label t3">Be aware</span>
-        <span style="font-size:10px;color:#6e7681">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''}</span>
-        <span class="tier-action">in blast radius</span>
-      </div>`;
-    data.be_aware.forEach(n => { html += renderCqNode(n, 3); });
-    html += `</div>`;
+    // ── Tier 1: will break ────────────────────────────────────
+    if (data.will_break && data.will_break.length) {
+      html += `<div class="tier-section">
+        <div class="tier-header">
+          <span class="tier-label t1">Will break</span>
+          <span style="font-size:10px;color:#f85149;opacity:.6">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''}</span>
+          <span class="tier-action t1">must address</span>
+        </div>`;
+      data.will_break.forEach(n => { html += renderCqNode(n, 1); });
+      html += `</div>`;
+    }
+
+    // ── Tier 2: likely need ───────────────────────────────────
+    if (data.likely_need && data.likely_need.length) {
+      html += `<div class="tier-section">
+        <div class="tier-header">
+          <span class="tier-label t2">Likely need</span>
+          <span style="font-size:10px;color:#6e7681">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''}</span>
+          <span class="tier-action">verify before shipping</span>
+        </div>`;
+      data.likely_need.forEach(n => { html += renderCqNode(n, 2); });
+      html += `</div>`;
+    }
+
+    // ── Tier 3: be aware ─────────────────────────────────────
+    if (data.be_aware && data.be_aware.length) {
+      html += `<div class="tier-section">
+        <div class="tier-header">
+          <span class="tier-label t3">Be aware</span>
+          <span style="font-size:10px;color:#6e7681">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''}</span>
+          <span class="tier-action">in blast radius</span>
+        </div>`;
+      data.be_aware.forEach(n => { html += renderCqNode(n, 3); });
+      html += `</div>`;
+    }
+
+    if (isDecision) {
+      html += `</div>`; // close .breakdown-section
+    }
   }
 
   document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
@@ -2225,6 +2328,16 @@ function toggleCqDetail(btn, e) {
   const card = btn.closest('.cq-node');
   const isExpanded = card.classList.toggle('expanded');
   btn.textContent = (isExpanded ? '▾ ' : '▸ ') + (btn.textContent.slice(2));
+}
+
+function toggleBreakdown(btn) {
+  const section = btn.nextElementSibling;
+  const isOpen = section.classList.toggle('open');
+  btn.classList.toggle('open', isOpen);
+  const total = btn.textContent.match(/\d+/)?.[0] || '';
+  btn.textContent = isOpen
+    ? `▾ Hide node breakdown`
+    : `▸ See full node breakdown (${total} nodes)`;
 }
 
 function highlightConsequenceNodes(data) {
