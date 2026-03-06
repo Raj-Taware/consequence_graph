@@ -131,7 +131,7 @@ python cli.py watch ./gsoc_repos
 
 ## Visual interface
 
-**Free exploration** — Force-directed graph of the full codebase. Nodes sized by in-degree. Color-coded by type. Cross-repo format contract nodes colored by mismatch risk (🔴 high / 🟡 medium / 🔵 low). Zoom reveals labels progressively. Click a node to fly to it.
+**Free exploration** — Force-directed graph of the full codebase. Nodes sized by in-degree. Color-coded by type. Cross-repo format contract nodes colored by mismatch risk (high / medium / low). Zoom reveals labels progressively. Click a node to fly to it.
 
 **Focus view** — Toggles the graph into an ego-network mode. Nodes outside a 2-hop radius of your selection (or the top 7 hubs by default) fade out, making massive graphs readable.
 
@@ -141,9 +141,9 @@ python cli.py watch ./gsoc_repos
 - Click a node → textarea pre-fills with structured context (type, severity, signature, tensor contracts)
 - Describe your change in plain English
 - Get a tiered consequence report:
-  - 🔴 **Will break** — must address before shipping
-  - 🟡 **Likely need** — verify before shipping  
-  - ⚪ **Be aware** — in blast radius, probably safe
+  - **Will break** — must fix - must address before shipping
+  - **Likely needs update** — review before shipping  
+  - **In scope** — broader impact area
 - **Comparison Verdicts** — Ask "Should I use A or B?" to get a ranked comparison of structural cost ratios and a clear verdict on which path has fewer downstream consequences.
 - **Config impact traversal** — Config keys (`config::`) are intelligently traversed upstream (who reads them) to accurately identify hyperparameter blast radii.
 - **Arity warnings** highlighted in red where return format changes cause `ValueError` at runtime

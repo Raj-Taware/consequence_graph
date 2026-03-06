@@ -1707,12 +1707,12 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="topbar">
-  <h1>⬡ consequencegraph</h1>
+  <h1>consequencegraph</h1>
   <input id="search-box" type="text" placeholder="Search nodes... (function, class, module)" autocomplete="off">
   <div id="search-results"></div>
-  <button id="btn-diff" onclick="loadDiff()">⎇ Diff vs main</button>
-  <button id="btn-reindex" onclick="reindex()">↺ Reindex</button>
-  <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">◎ Focus view</button>
+  <button id="btn-diff" onclick="loadDiff()">Diff vs main</button>
+  <button id="btn-reindex" onclick="reindex()">Reindex</button>
+  <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">Focus view</button>
   <span id="stats-bar">loading...</span>
 </div>
 
@@ -1755,13 +1755,13 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="consequence-panel">
       <div class="panel-label">
-        ⚡ View Consequence
+        View Consequence
         <span id="cq-hint">click a node to pre-fill context</span>
       </div>
       <div class="query-chip-label">Example queries</div>
       <div class="query-chips">
-        <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">🔴 What breaks if I change <code>to_pyg()</code>?</button>
-        <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">⚡ Add tensor to <code>__getitem__</code> return tuple</button>
+        <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">What breaks if I change <code>to_pyg()</code>?</button>
+        <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">Add tensor to <code>__getitem__</code> return tuple</button>
         <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">⚖️ Compare <code>g2m</code> vs <code>m2m</code> impact</button>
       </div>
       <textarea id="consequence-query" rows="3"
@@ -2048,7 +2048,7 @@ function renderImpactSidebar(node, impact) {
   let html = `
     <div class="meta-row">
       <span class="meta-pill">${meta.type || node.type}</span>
-      ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
+      ${meta.is_lightning_hook ? '<span class="meta-pill hook">Lightning hook</span>' : ''}
       <span class="severity-badge sev-${sev}">${sev}</span>
     </div>`;
 
@@ -2183,7 +2183,7 @@ function renderConsequenceSidebar(data) {
   const changeLabels = {
     return_format_change:  '⟳ Return format',
     signature_change:      '⟨⟩ Signature',
-    dimension_change:      '⊞ Dimension',
+    dimension_change:      'Dimension',
     rename:                '✎ Rename',
     removal:               '✕ Removal',
     add_tensor_component:  '⊕ New tensor',
@@ -2389,7 +2389,7 @@ function renderConsequenceSidebar(data) {
     }
   }
 
-  document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
+  document.getElementById('sidebar-title').textContent = 'Consequence analysis';
   // Prepend a back button so user can return to the graph explorer view
   html = `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>` + html;
   document.getElementById('sidebar-content').innerHTML = html;
@@ -2413,7 +2413,7 @@ function renderCqNode(n, tier) {
 
   // Badges for detail row
   const hookBadge = n.is_hook
-    ? `<span class="cq-badge hook-badge">⚡ hook<span class="badge-tip">PyTorch Lightning hook — the framework enforces this signature contract at runtime.</span></span>`
+    ? `<span class="cq-badge hook-badge">hook<span class="badge-tip">PyTorch Lightning hook — the framework enforces this signature contract at runtime.</span></span>`
     : '';
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
     ? `<span class="cq-badge shape-badge">shapes<span class="badge-tip">This node has known tensor shape contracts.</span></span>`
@@ -2587,7 +2587,7 @@ async function loadDiff() {
       <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
     </div>`;
   });
-  document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
+  document.getElementById('sidebar-title').textContent = 'Diff impact vs main';
   document.getElementById('sidebar-content').innerHTML = html;
 }
 
@@ -2677,12 +2677,12 @@ function updateStatsBar() {
   if (viewMode === 'focus') {
     document.getElementById('stats-bar').textContent =
       `Showing ${shown} of ${total} nodes · ${allEdges.length} edges`;
-    btn.textContent = '◎ Focus view';
+    btn.textContent = 'Focus view';
     btn.classList.remove('full-mode');
   } else {
     document.getElementById('stats-bar').textContent =
       `${total} nodes · ${allEdges.length} edges (full graph)`;
-    btn.textContent = '⊞ Full graph';
+    btn.textContent = 'Full graph';
     btn.classList.add('full-mode');
   }
 }
