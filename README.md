@@ -131,7 +131,9 @@ python cli.py watch ./gsoc_repos
 
 ## Visual interface
 
-**Free exploration** — Force-directed graph of the full codebase. Nodes sized by in-degree. Color-coded by type. Cross-repo format contract nodes colored by mismatch risk (🔴 high / 🟡 medium / 🔵 low). Zoom reveals labels progressively. Click a node and the camera flies to it.
+**Free exploration** — Force-directed graph of the full codebase. Nodes sized by in-degree. Color-coded by type. Cross-repo format contract nodes colored by mismatch risk (🔴 high / 🟡 medium / 🔵 low). Zoom reveals labels progressively. Click a node to fly to it.
+
+**Focus view** — Toggles the graph into an ego-network mode. Nodes outside a 2-hop radius of your selection (or the top 7 hubs by default) fade out, making massive graphs readable.
 
 **Blast radius** — Click any node. Upstream dependencies glow, downstream consequences highlight, intensity by severity. Sidebar shows the full impact report with edge-type annotations and tensor shape contracts.
 
@@ -142,6 +144,8 @@ python cli.py watch ./gsoc_repos
   - 🔴 **Will break** — must address before shipping
   - 🟡 **Likely need** — verify before shipping  
   - ⚪ **Be aware** — in blast radius, probably safe
+- **Comparison Verdicts** — Ask "Should I use A or B?" to get a ranked comparison of structural cost ratios and a clear verdict on which path has fewer downstream consequences.
+- **Config impact traversal** — Config keys (`config::`) are intelligently traversed upstream (who reads them) to accurately identify hyperparameter blast radii.
 - **Arity warnings** highlighted in red where return format changes cause `ValueError` at runtime
 
 **Diff view** — Click **"Diff vs main"**. Every function changed on the current branch, ranked by severity. See the blast radius of your diff before a reviewer does.
