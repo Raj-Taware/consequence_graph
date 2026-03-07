@@ -85,6 +85,8 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
+    if not os.path.isdir(_index_path):  # C1: Path traversal protection
+        raise RuntimeError(f"Index path does not exist or is not a directory: {_index_path}")
     # C4: prefer <path>/cache.json (pre-built on Render); fall back to dev-mode path
     _path_cache = os.path.join(_index_path, "cache.json")
     cache = _path_cache if os.path.isfile(_path_cache) else os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
@@ -1325,8 +1327,9 @@ def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before 
             capture_output=True, text=True, cwd=_index_path
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
-    except Exception:
-        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2
+    except Exception as e:
+        msg = "Git operation failed." if PRODUCTION else str(e).replace(_index_path, "<index_path>")
+        raise HTTPException(status_code=500, detail=msg)  # M2
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -2500,24 +2503,24 @@ async function selectNode(d) {
 function renderImpactSidebar(node, impact) {
   const br = impact.blast_radius || {};
   const meta = impact.target_meta || {};
-  const sev = impact.severity || 'low';
+  const sev = _h(impact.severity || 'low');
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${meta.type || node.type}</span>
+      <span class="meta-pill">${_h(meta.type || node.type)}</span>
       ${meta.is_lightning_hook ? '<span class="meta-pill hook">Lightning hook</span>' : ''}
       <span class="severity-badge sev-${sev}">${sev}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${_h(meta.line || 0)}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
   }
 
   // Tensor shapes
@@ -2536,13 +2539,13 @@ function renderImpactSidebar(node, impact) {
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
       </div></div>`;
   }
 
