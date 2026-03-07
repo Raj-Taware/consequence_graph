@@ -3,6 +3,10 @@
 **Consequence-aware code knowledge graph for Python ML codebases.**  
 *Rank downstream breakage by severity. Simulate changes before you make them. See cross-repo format contracts as first-class graph edges.*
 
+🌐 **[Try the Live Demo](https://consequencegraph.onrender.com)**
+
+
+
 ---
 
 ## The problem this solves
