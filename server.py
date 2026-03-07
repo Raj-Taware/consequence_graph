@@ -212,47 +212,9 @@ def api_stats():
     return get_graph().stats()
 
 
-@app.get("/api/debug/node/{node_name}")
-def api_debug_node(node_name: str):
-    """Temporary: trace what happens to a node name through the resolution pipeline."""
-    graph = get_graph()
-    engine = get_engine()
-
-    # 1. What nodes exist with this name?
-    matching = [(nid, data) for nid, data in graph.g.nodes(data=True)
-                if data.get("name", "").lower() == node_name.lower()
-                or nid.lower() == node_name.lower()
-                or nid.lower().endswith(f"::{node_name.lower()}")
-                or nid.lower().endswith(f".{node_name.lower()}")]
-
-    # 2. What does _cq_extract_nodes return?
-    from server import _cq_extract_nodes
-    extracted = _cq_extract_nodes(node_name, graph)
-
-    results = {}
-    for nid, data in matching[:5]:
-        up = graph.upstream(nid, depth=3)
-        dn = graph.downstream(nid, depth=3)
-        impact = engine.impact(nid, depth=3)
-        results[nid] = {
-            "node_type": data.get("node_type"),
-            "name": data.get("name"),
-            "upstream_count": len(up),
-            "downstream_count": len(dn),
-            "upstream_sample": [e["node"] for e in up[:3]],
-            "downstream_sample": [e["node"] for e in dn[:3]],
-            "engine_impact_error": impact.get("error") or impact.get("ambiguous"),
-            "engine_impact_downstream": impact.get("blast_radius", {}).get("downstream_count", "N/A"),
-        }
-
-    return {
-        "query": node_name,
-        "extracted_by_cq": extracted,
-        "matching_nodes": results,
-    }
 
 
-
+@app.post("/api/reindex")
 def api_reindex():
     if PRODUCTION:
         raise HTTPException(status_code=403, detail="Reindex disabled in production demo.")
@@ -290,9 +252,78 @@ async def api_consequence(request: Request):
     if anchor_id and graph.has_node(anchor_id) and anchor_id not in mentioned:  # C2
         mentioned.insert(0, anchor_id)
     if not mentioned:
+        # Try to suggest real node names by extracting code-identifier-shaped tokens.
+        # Only use words that look like identifiers: contain underscores, are camelCase,
+        # or are long enough to be specific (≥8 chars). Skip plain English words.
+        _ENGLISH_STOPWORDS = {
+            "what", "which", "where", "when", "does", "will", "break", "change",
+            "function", "functions", "class", "classes", "method", "methods",
+            "read", "write", "return", "call", "calls", "use", "uses", "used",
+            "with", "from", "into", "this", "that", "their", "there", "these",
+            "those", "have", "should", "would", "could", "affect", "affects",
+            "impact", "impacts", "downstream", "upstream", "depend", "depends",
+            "feature", "features", "encoding", "positional", "spatial", "global",
+            "local", "static", "input", "output", "tensor", "model", "data",
+            "node", "nodes", "graph", "layer", "layers", "module", "modules",
+            "train", "training", "forward", "backward", "loss", "batch",
+        }
+
+        def _looks_like_identifier(word: str) -> bool:
+            """True if word looks like a code symbol rather than plain English."""
+            if "_" in word:          return True   # snake_case: lat_lon_static
+            if word[0].isupper() and any(c.islower() for c in word[1:]) \
+               and any(c.isupper() for c in word[1:]):
+                return True                         # CamelCase: WeatherDataset
+            if len(word) >= 10:      return True    # long enough to be specific
+            return False
+
+        raw_words = [w.strip('.,?!()[]') for w in query_text.split()]
+        candidate_words = [
+            w for w in raw_words
+            if len(w) >= 4
+            and w.lower() not in _ENGLISH_STOPWORDS
+            and _looks_like_identifier(w)
+        ]
+
+        suggestions = []
+        seen_names: set = set()
+        for word in candidate_words[:6]:
+            word_lower = word.lower()
+            for nid, data in graph.g.nodes(data=True):
+                name = data.get("name", "")
+                if name in seen_names:
+                    continue
+                if any(nid.startswith(p) for p in ("config::", "hook::", "tensor_contract::")):
+                    continue
+                # Require the match to be on a meaningful boundary
+                name_lower = name.lower()
+                nid_lower  = nid.lower()
+                match = (
+                    word_lower == name_lower                           # exact name match
+                    or word_lower in name_lower.split("_")             # snake part match
+                    or f"_{word_lower}" in nid_lower                   # suffix in ID
+                    or nid_lower.endswith(f".{word_lower}")            # module.name
+                    or (len(word_lower) >= 6 and word_lower in name_lower)  # substring, long only
+                )
+                if match:
+                    suggestions.append({"id": nid, "name": name, "file": data.get("file_path","")})
+                    seen_names.add(name)
+                if len(suggestions) >= 6:
+                    break
+            if len(suggestions) >= 6:
+                break
+
+        no_identifiers = len(candidate_words) == 0
+        hint = (
+            "This query uses descriptive language but no code identifiers. "
+            "Try searching for the function or class name directly — e.g. use the search box above to find it, then click the node to pre-fill the query."
+            if no_identifiers else
+            "Mention function or class names from the codebase directly — e.g. 'WeatherDataset.__getitem__' or 'training_step'."
+        )
         return {
             "error": "No known nodes found in query.",
-            "hint": "Mention function or class names from the codebase, e.g. 'WeatherDataset.__getitem__' or 'training_step'.",
+            "hint": hint,
+            "suggestions": suggestions[:6],
         }
 
     # 2. Classify intent
@@ -806,6 +837,112 @@ def _cq_consequence_sentence(
     name    = node_data.get("name", node_id.split(".")[-1])
     is_hook = node_data.get("is_lightning_hook", False)
     shapes  = node_data.get("tensor_shapes", {})
+    ntype   = node_data.get("node_type", "")
+    n_origins = len({r["origin"] for r in reasons})
+    file    = node_data.get("file_path", "")
+    fname   = file.split("\\")[-1].split("/")[-1] if file else ""
+    loc     = f" ({fname}:{node_data.get('line_no','')})" if fname else ""
+    origin  = reasons[0]["origin"].split(".")[-1] if reasons else "a mentioned node"
+
+    # Shape hint
+    shape_hint = ""
+    if shapes:
+        k, v = next(iter(shapes.items()))
+        sv = v.get("shape", v) if isinstance(v, dict) else v
+        shape_hint = f" — current contract: `{k}: {sv}`"
+
+    # ── Decision / comparison intent ─────────────────────────────────────────
+    # For comparison queries, describe *why this node matters* for the decision.
+    if intent == "decision":
+        if is_hook:
+            return f"`{name}`{loc} is a Lightning hook shared by both paths — whichever option you choose, this hook must be updated to match the new contract."
+        if "tests" in node_id or name.startswith("test_"):
+            origins = list({r["origin"].split(".")[-1] for r in reasons})[:2]
+            return f"`{name}`{loc} exercises {'both' if n_origins > 1 else 'this'} path{'s' if n_origins > 1 else ''} — it will need updating regardless of which option you choose."
+        if "consumes_format" in edges or "produces_tensor_for" in edges:
+            return f"`{name}`{loc} sits in the tensor data flow from `{origin}` — the format contract here changes under either option."
+        if n_origins > 1:
+            origins_str = ", ".join(list({r["origin"].split(".")[-1] for r in reasons})[:2])
+            return f"`{name}`{loc} is affected by both `{origins_str}` — this is shared coupling that both options carry."
+        return f"`{name}`{loc} is downstream of `{origin}` at depth {depth} — affected by this path."
+
+    # ── Specific change types ─────────────────────────────────────────────────
+    if change_type == "return_format_change":
+        if "consumes_format" in edges:
+            return f"`{name}`{loc} unpacks this return value directly. Adding a tensor shifts the tuple — destructuring breaks here."
+        if "produces_tensor_for" in edges:
+            return f"`{name}`{loc} has an explicit tensor shape contract{shape_hint}. The contract must be updated to reflect the new output."
+        if is_hook:
+            return f"Lightning hook `{name}`{loc} receives this as its batch input — a format change causes a runtime mismatch at the framework boundary."
+
+    if change_type == "add_tensor_component":
+        if "__init__" in node_id:
+            return f"`{name}`{loc} is where `register_buffer(...)` must be called — buffers registered here persist across devices, checkpoints, and `.to()` calls."
+        if "consumes_format" in edges or "produces_tensor_for" in edges:
+            return f"`{name}`{loc} sits in the tensor data flow{shape_hint}. The new weight tensor must be threaded through here explicitly."
+        if is_hook:
+            return f"Lightning hook `{name}`{loc} — this is where the buffer gets applied to the loss. It must be in scope here."
+
+    if change_type == "signature_change":
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this directly at depth {depth} — all argument lists at this call site need updating."
+        if "inherits" in edges:
+            return f"`{name}`{loc} inherits this method — the override signature must remain compatible or the MRO breaks."
+        if "overrides_hook" in edges:
+            return f"`{name}`{loc} implements a Lightning hook — the framework enforces the signature contract, changing it breaks training."
+
+    if change_type == "rename":
+        if "named_reference" in edges:
+            return f"`{name}`{loc} references this name in a docstring or string literal — won't break at runtime but becomes stale documentation."
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this by name — call sites break immediately on rename."
+        if "imports" in edges:
+            return f"`{name}`{loc} imports this symbol — the import path breaks on rename."
+
+    if change_type == "removal":
+        if "inherits" in edges:
+            return f"`{name}`{loc} inherits from this class — removing it collapses the entire class hierarchy at this point."
+        if "calls" in edges:
+            return f"`{name}`{loc} calls this directly — removal raises `AttributeError` here at runtime."
+        return f"`{name}`{loc} depends on this existing — removal causes `NameError` or `ImportError` at this file."
+
+    if change_type == "dimension_change":
+        if shapes:
+            return f"`{name}`{loc} has shape contract{shape_hint} — the dimension change propagates into this contract."
+        if "produces_tensor_for" in edges or "consumes_format" in edges:
+            return f"`{name}`{loc} is in the tensor flow path — a dimension change cascades here via shape-dependent operations."
+
+    if change_type == "config_change":
+        if "reads_config" in edges:
+            return f"`{name}`{loc} reads this config key — a rename or removal breaks the lookup silently (returns None, not an exception)."
+
+    # ── Generic fallback — role-specific, never generic ──────────────────────
+    # Use node role + edge type to produce a specific sentence rather than the
+    # "appears in blast radius" canned phrase.
+    if is_hook:
+        return f"Lightning hook `{name}`{loc} — framework contract at this boundary will be affected."
+    if name.startswith("test_") or "tests" in node_id:
+        return f"`{name}`{loc} tests the behaviour of `{origin}` — will need updating to match the new contract."
+    if ntype == "class":
+        return f"`{name}`{loc} is a class connected via `{'|'.join(list(edges)[:2]) or 'dependency'}` from `{origin}` — check constructor and method signatures."
+    if "reads_config" in edges:
+        return f"`{name}`{loc} reads config from `{origin}` — verify the key still exists and has the expected shape."
+    if "calls" in edges:
+        depth_word = "directly" if depth == 1 else f"at depth {depth}"
+        return f"`{name}`{loc} calls into `{origin}` {depth_word} — update this call site."
+    if "inherits" in edges:
+        return f"`{name}`{loc} inherits from `{origin}` — verify compatibility with the new interface."
+    if "consumes_format" in edges:
+        return f"`{name}`{loc} consumes output from `{origin}` — the format contract here changes."
+    if "produces_tensor_for" in edges:
+        return f"`{name}`{loc} produces tensors consumed by `{origin}` — shape contracts may need updating."
+    if n_origins > 1:
+        origins_str = ", ".join(list({r["origin"].split(".")[-1] for r in reasons})[:2])
+        return f"`{name}`{loc} is in the shared blast radius of `{origins_str}` — verify it handles the new interface."
+    edge_desc = next(iter(edges), "dependency")
+    return f"`{name}`{loc} is connected to `{origin}` via `{edge_desc}` at depth {depth}."
+
+
     n_origins = len({r["origin"] for r in reasons})
     file    = node_data.get("file_path", "")
     fname   = file.split("\\")[-1].split("/")[-1] if file else ""
@@ -1266,6 +1403,82 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   #btn-diff { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
   #btn-diff:hover { border-color: #58a6ff; color: #58a6ff; }
   #btn-reindex { padding: 6px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-size: 11px; cursor: pointer; }
+  #btn-help {
+    padding: 6px 10px; background: none; border: 1px solid #30363d;
+    border-radius: 6px; color: #6e7681; font-size: 11px; cursor: pointer;
+    transition: color 0.15s, border-color 0.15s; font-family: inherit;
+  }
+  #btn-help:hover { color: #e6edf3; border-color: #8b949e; }
+
+  /* ── Help / glossary modal ──────────────────────────────── */
+  #help-overlay {
+    position: fixed; inset: 0; z-index: 1001;
+    background: rgba(1,4,9,0.88); backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #help-overlay.hidden { display: none; }
+  .help-box {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 32px 36px; max-width: 600px; width: 92%; max-height: 85vh;
+    overflow-y: auto; box-shadow: 0 24px 80px rgba(0,0,0,0.6);
+  }
+  .help-box h2 { font-size: 16px; color: #e6edf3; margin-bottom: 4px; }
+  .help-box .help-sub { font-size: 11px; color: #6e7681; margin-bottom: 24px; }
+  .help-section { margin-bottom: 24px; }
+  .help-section-title {
+    font-size: 9px; color: #6e7681; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 10px;
+    padding-bottom: 6px; border-bottom: 1px solid #21262d;
+  }
+  .help-term {
+    display: grid; grid-template-columns: 140px 1fr;
+    gap: 8px 16px; padding: 7px 0; border-bottom: 1px solid #161b22;
+    align-items: start;
+  }
+  .help-term:last-child { border-bottom: none; }
+  .help-term-name {
+    font-size: 11px; font-weight: 600; color: #79c0ff;
+    font-family: 'SF Mono', monospace;
+  }
+  .help-term-def { font-size: 11px; color: #c9d1d9; line-height: 1.6; }
+  .help-term-def code {
+    background: #21262d; padding: 1px 4px; border-radius: 3px;
+    color: #79c0ff; font-size: 10px;
+  }
+  .help-kbd {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 0;
+  }
+  .help-kbd kbd {
+    background: #21262d; border: 1px solid #30363d; border-radius: 4px;
+    padding: 2px 7px; font-size: 10px; color: #c9d1d9;
+    font-family: 'SF Mono', monospace; min-width: 24px; text-align: center;
+  }
+  .help-kbd span { font-size: 11px; color: #8b949e; }
+  .help-close {
+    margin-top: 20px; padding: 8px 20px; background: #21262d;
+    border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
+    font-size: 12px; cursor: pointer; font-family: inherit; float: right;
+  }
+  .help-close:hover { background: #30363d; }
+
+  /* ── Copy as Markdown button ────────────────────────────── */
+  .copy-md-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; color: #6e7681; background: none;
+    border: 1px solid #21262d; border-radius: 5px;
+    padding: 4px 9px; cursor: pointer; font-family: inherit;
+    transition: color 0.12s, border-color 0.12s; margin-bottom: 12px;
+  }
+  .copy-md-btn:hover { color: #c9d1d9; border-color: #30363d; }
+  .copy-md-btn.copied { color: #3fb950; border-color: #3fb950; }
+
+  /* ── Query history hint ─────────────────────────────────── */
+  .history-hint {
+    font-size: 9px; color: #6e7681; margin-bottom: 4px;
+    display: none;
+  }
+  .history-hint.visible { display: block; }
   #btn-view-toggle {
     padding: 6px 12px; background: #0d2211; border: 1px solid #3fb950;
     border-radius: 6px; color: #3fb950; font-size: 11px; cursor: pointer;
@@ -1332,14 +1545,14 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #8b949e; font-size: 13px; }
 
   .node { cursor: pointer; }
-  .node circle { stroke-width: 1.5px; transition: r 0.15s; }
-  .node:hover circle { stroke-width: 2.5px; }
-  .node.selected circle { stroke-width: 3px; }
-  .node.dimmed { opacity: 0.12; }
-  .node.highlighted circle { stroke-width: 3px; }
+  .node circle { stroke-width: 1.5px; transition: r 0.15s, filter 0.15s; }
+  .node:hover circle { stroke-width: 2.5px; filter: brightness(1.35) drop-shadow(0 0 5px currentColor); }
+  .node.selected circle { stroke-width: 3px; filter: brightness(1.5) drop-shadow(0 0 8px currentColor); }
+  .node.dimmed { opacity: 0.14; }
+  .node.highlighted circle { stroke-width: 3px; filter: brightness(1.3); }
 
-  .link { stroke-opacity: 0.35; fill: none; }
-  .link.highlighted { stroke-opacity: 0.9; stroke-width: 2px; }
+  .link { stroke-opacity: 0.55; fill: none; }
+  .link.highlighted { stroke-opacity: 1.0; stroke-width: 2.5px; }
   .link.dimmed { stroke-opacity: 0.04; }
 
   .node-label { font-size: 9px; fill: #8b949e; pointer-events: none; }
@@ -1498,6 +1711,25 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .verdict-delta strong { color: #8b949e; }
 
   /* Breakdown toggle for decision intent */
+  /* ── Inline error card ───────────────────────────────────── */
+  .cq-error-card {
+    background: #1a0a0a; border: 1px solid #6e1414; border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .cq-error-title { font-size: 12px; color: #f85149; font-weight: 600; margin-bottom: 6px; }
+  .cq-error-hint  { font-size: 11px; color: #8b949e; line-height: 1.6; margin-bottom: 10px; }
+  .cq-error-suggestions { font-size: 10px; color: #6e7681; margin-bottom: 6px; }
+  .cq-suggestion-btn {
+    display: block; width: 100%; text-align: left;
+    background: #21262d; border: 1px solid #30363d; border-radius: 5px;
+    padding: 6px 10px; margin-bottom: 5px; cursor: pointer;
+    font-size: 11px; color: #79c0ff; font-family: 'SF Mono', monospace;
+    transition: background 0.12s; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cq-suggestion-btn:hover { background: #30363d; }
+  .cq-suggestion-file { color: #6e7681; font-family: inherit; font-size: 10px; }
+
   /* Back to explorer button */
   .back-btn {
     display: inline-flex; align-items: center; gap: 5px;
@@ -1542,6 +1774,7 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .arity-card .arity-msg  { font-size:11px; color:#c9d1d9; margin-top:6px; line-height:1.5; }
 
   /* ── Welcome overlay ────────────────────────────────────── */
+  /* ── 3-step onboarding tour ─────────────────────────────── */
   #welcome-overlay {
     position: fixed; inset: 0; z-index: 1000;
     background: rgba(1,4,9,0.92); backdrop-filter: blur(6px);
@@ -1551,44 +1784,106 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   #welcome-overlay.hidden { display: none; }
   @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
 
-  .welcome-box {
+  .tour-box {
     background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-    padding: 36px 40px; max-width: 560px; width: 90%;
+    padding: 36px 40px; max-width: 540px; width: 90%;
     box-shadow: 0 24px 80px rgba(0,0,0,0.6);
   }
-  .welcome-box .wc-logo { font-size: 28px; margin-bottom: 6px; }
-  .welcome-box h2 { font-size: 18px; color: #e6edf3; margin-bottom: 8px; font-weight: 700; }
-  .welcome-box .wc-sub {
-    font-size: 12px; color: #8b949e; line-height: 1.7; margin-bottom: 24px;
-    border-left: 2px solid #30363d; padding-left: 12px;
-  }
-  .welcome-box .wc-sub strong { color: #58a6ff; font-weight: 600; }
 
-  .wc-section-label {
-    font-size: 9px; color: #6e7681; text-transform: uppercase;
-    letter-spacing: 0.1em; margin-bottom: 10px;
+  /* Step indicator */
+  .tour-steps {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 28px;
   }
-  .wc-examples { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
+  .tour-step-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: #21262d;
+    transition: background 0.2s;
+  }
+  .tour-step-dot.active { background: #3fb950; }
+  .tour-step-dot.done   { background: #238636; }
+  .tour-step-label {
+    font-size: 9px; color: #6e7681; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-left: 4px;
+  }
+
+  /* Step content */
+  .tour-slide { display: none; }
+  .tour-slide.active { display: block; }
+  .tour-slide-icon { font-size: 32px; margin-bottom: 12px; }
+  .tour-slide h2 { font-size: 17px; color: #e6edf3; margin-bottom: 10px; font-weight: 700; }
+  .tour-slide p {
+    font-size: 12px; color: #8b949e; line-height: 1.8; margin-bottom: 20px;
+  }
+  .tour-slide p strong { color: #c9d1d9; }
+  .tour-slide p code {
+    background: #21262d; padding: 1px 5px; border-radius: 3px;
+    color: #79c0ff; font-size: 11px;
+  }
+
+  /* Visual demo area */
+  .tour-demo {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 20px; font-size: 11px;
+  }
+  .tour-demo-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 0; border-bottom: 1px solid #161b22; color: #c9d1d9;
+  }
+  .tour-demo-row:last-child { border-bottom: none; }
+  .tour-demo-dot {
+    width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  }
+  .tour-demo-label { flex: 1; font-family: 'SF Mono', monospace; font-size: 10px; }
+  .tour-demo-badge {
+    font-size: 9px; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+  }
+  .sev-high   { background: #3d1a1a; color: #f85149; }
+  .sev-medium { background: #2d2208; color: #e3b341; }
+  .sev-low    { background: #1a1f2e; color: #58a6ff; }
+
+  /* Query demo */
+  .tour-query-demo {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 10px; font-size: 11px; color: #c9d1d9;
+    font-style: italic;
+  }
+  .tour-query-result {
+    background: #0d1a12; border: 1px solid #1f6329; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 20px; font-size: 11px; color: #3fb950;
+  }
+
+  /* Example queries on step 3 */
+  .wc-examples { display: flex; flex-direction: column; gap: 7px; margin-bottom: 20px; }
   .wc-example {
-    padding: 10px 14px; background: #0d1117; border: 1px solid #21262d;
+    padding: 9px 13px; background: #0d1117; border: 1px solid #21262d;
     border-radius: 7px; cursor: pointer; transition: border-color 0.15s, background 0.15s;
     display: flex; align-items: flex-start; gap: 10px;
   }
   .wc-example:hover { border-color: #3fb950; background: #0d1a12; }
-  .wc-example .wc-ex-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
-  .wc-example .wc-ex-text { font-size: 11px; color: #c9d1d9; line-height: 1.5; }
-  .wc-example .wc-ex-text em { color: #79c0ff; font-style: normal; font-size: 10px; display: block; margin-top: 2px; }
+  .wc-ex-icon { font-size: 13px; flex-shrink: 0; margin-top: 1px; }
+  .wc-ex-text { font-size: 11px; color: #c9d1d9; line-height: 1.5; }
+  .wc-ex-text em { color: #6e7681; font-style: normal; font-size: 10px; display: block; margin-top: 2px; }
 
-  .wc-footer { display: flex; align-items: center; justify-content: space-between; }
-  .wc-how { font-size: 10px; color: #6e7681; line-height: 1.6; }
-  .wc-how span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
-  .wc-how span::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3fb950; }
-  #btn-dismiss-welcome {
-    padding: 9px 20px; background: #238636; border: none; border-radius: 7px;
-    color: white; font-size: 12px; cursor: pointer; font-family: inherit;
-    font-weight: 600; white-space: nowrap; transition: background 0.15s;
+  /* Nav buttons */
+  .tour-nav {
+    display: flex; align-items: center; justify-content: space-between;
   }
-  #btn-dismiss-welcome:hover { background: #2ea043; }
+  .tour-btn-back {
+    padding: 8px 16px; background: none; border: 1px solid #30363d;
+    border-radius: 7px; color: #6e7681; font-size: 12px; cursor: pointer;
+    font-family: inherit; transition: color 0.12s;
+  }
+  .tour-btn-back:hover { color: #c9d1d9; }
+  .tour-btn-next {
+    padding: 9px 22px; background: #238636; border: none; border-radius: 7px;
+    color: white; font-size: 12px; cursor: pointer; font-family: inherit;
+    font-weight: 600; transition: background 0.15s;
+  }
+  .tour-btn-next:hover { background: #2ea043; }
+  .tour-skip {
+    font-size: 10px; color: #6e7681; background: none; border: none;
+    cursor: pointer; font-family: inherit; padding: 0;
+  }
+  .tour-skip:hover { color: #8b949e; }
 
   /* ── Hot nodes (empty sidebar state) ───────────────────── */
   .hot-nodes-section { padding: 4px 0; }
@@ -1662,47 +1957,198 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 
 <!-- ── Welcome overlay ────────────────────────────────────── -->
 <div id="welcome-overlay">
-  <div class="welcome-box">
-    <div class="wc-logo">⬡</div>
-    <h2>consequencegraph</h2>
-    <p class="wc-sub">
-      A cross-repo static analysis tool that makes <strong>invisible ML couplings visible</strong> —
-      Lightning hook contracts, tensor format agreements, and disk-format dependencies between
-      <strong>wmg</strong> and <strong>neural-lam</strong> that no IDE can see.
-    </p>
+  <div class="tour-box">
 
-    <div class="wc-section-label">Try an example query →</div>
-    <div class="wc-examples">
-      <div class="wc-example" onclick="dismissAndQuery('What breaks in neural-lam if I change the output format of to_pyg?')">
-        <div class="wc-ex-icon">🔴</div>
-        <div class="wc-ex-text">
-          What breaks if I change <code>to_pyg()</code>'s output format?
-          <em>Cross-repo blast radius — wmg serializer → neural-lam load pipeline</em>
+    <!-- Step indicator -->
+    <div class="tour-steps">
+      <div class="tour-step-dot active" id="tdot-0"></div>
+      <div class="tour-step-dot" id="tdot-1"></div>
+      <div class="tour-step-dot" id="tdot-2"></div>
+      <span class="tour-step-label" id="tour-step-label">Step 1 of 3</span>
+      <button class="tour-skip" onclick="dismissWelcome()" style="margin-left:auto">Skip tour</button>
+    </div>
+
+    <!-- Step 1: What are nodes? -->
+    <div class="tour-slide active" id="tour-slide-0">
+      <div class="tour-slide-icon">⬡</div>
+      <h2>Every function is a node. Every coupling is an edge.</h2>
+      <p>
+        This graph maps <strong>two real repos</strong> — weather-model-graphs (wmg) and neural-lam —
+        as a single dependency graph. Nodes are functions, classes, Lightning hooks, and config keys.
+        Edges are the couplings between them: calls, tensor format contracts, disk-format dependencies.
+      </p>
+      <div class="tour-demo">
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#f85149"></div>
+          <div class="tour-demo-label">to_pyg</div>
+          <div class="tour-demo-badge sev-high">high impact</div>
+        </div>
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#e3b341"></div>
+          <div class="tour-demo-label">create_all_graph_components</div>
+          <div class="tour-demo-badge sev-medium">medium</div>
+        </div>
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#58a6ff"></div>
+          <div class="tour-demo-label">WeatherDataset.__getitem__</div>
+          <div class="tour-demo-badge sev-low">low</div>
         </div>
       </div>
-      <div class="wc-example" onclick="dismissAndQuery('What Lightning hooks does WeatherDataset.__getitem__ affect if I add a tensor to its return tuple?')">
-        <div class="wc-ex-icon">⚡</div>
-        <div class="wc-ex-text">
-          What Lightning hooks does <code>WeatherDataset.__getitem__</code> affect?
-          <em>Tensor format change → training_step → forward cascade</em>
-        </div>
-      </div>
-      <div class="wc-example" onclick="dismissAndQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">
-        <div class="wc-ex-icon">⚖️</div>
-        <div class="wc-ex-text">
-          Compare modifying <code>g2m</code> vs <code>m2m</code> — which is cheaper?
-          <em>Design decision — structural cost comparison</em>
-        </div>
+      <div class="tour-nav">
+        <span></span>
+        <button class="tour-btn-next" onclick="tourNext()">Next →</button>
       </div>
     </div>
 
-    <div class="wc-footer">
-      <div class="wc-how">
-        <span>Click a node to see its blast radius</span>
-        <span>Type a query to analyse consequences</span>
+    <!-- Step 2: Click a node -->
+    <div class="tour-slide" id="tour-slide-1">
+      <div class="tour-slide-icon">🖱</div>
+      <h2>Click any node to see its impact scope.</h2>
+      <p>
+        Clicking a node shows everything that <strong>depends on it</strong> — ranked by how badly it
+        would break. The graph zooms to show only the relevant neighbourhood.
+        Cross-repo edges are shown in a distinct colour — these are the couplings your IDE can't see.
+      </p>
+      <div class="tour-demo">
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#f85149"></div>
+          <div class="tour-demo-label">training_step <span style="color:#6e7681">← neural-lam</span></div>
+          <div class="tour-demo-badge sev-high">will break</div>
+        </div>
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#e3b341"></div>
+          <div class="tour-demo-label">load_graph_from_disk <span style="color:#6e7681">← neural-lam</span></div>
+          <div class="tour-demo-badge sev-medium">likely needs update</div>
+        </div>
+        <div class="tour-demo-row">
+          <div class="tour-demo-dot" style="background:#3fb950"></div>
+          <div class="tour-demo-label">test_create_graph_generic <span style="color:#6e7681">← wmg</span></div>
+          <div class="tour-demo-badge" style="background:#1a2d1a;color:#3fb950">in scope</div>
+        </div>
       </div>
-      <button id="btn-dismiss-welcome" onclick="dismissWelcome()">Explore the graph →</button>
+      <div class="tour-nav">
+        <button class="tour-btn-back" onclick="tourBack()">← Back</button>
+        <button class="tour-btn-next" onclick="tourNext()">Next →</button>
+      </div>
     </div>
+
+    <!-- Step 3: Ask a question -->
+    <div class="tour-slide" id="tour-slide-2">
+      <div class="tour-slide-icon">⚡</div>
+      <h2>Ask what breaks before you change anything.</h2>
+      <p>
+        Type a change description in the panel at the bottom — mention the <strong>function or class name</strong>
+        directly. The tool classifies your intent, finds affected nodes, and ranks them by severity.
+        Try one of these to start:
+      </p>
+      <div class="wc-examples">
+        <div class="wc-example" onclick="dismissAndQuery('What breaks in neural-lam if I change the output format of to_pyg?')">
+          <div class="wc-ex-icon">🔴</div>
+          <div class="wc-ex-text">What breaks if I change <code>to_pyg()</code>'s output format?
+            <em>Cross-repo impact — wmg serializer → neural-lam loader</em></div>
+        </div>
+        <div class="wc-example" onclick="dismissAndQuery('What Lightning hooks does WeatherDataset.__getitem__ affect if I add a tensor to its return tuple?')">
+          <div class="wc-ex-icon">⚡</div>
+          <div class="wc-ex-text">Add a tensor to <code>WeatherDataset.__getitem__</code>'s return tuple
+            <em>Tensor format change → training cascade</em></div>
+        </div>
+        <div class="wc-example" onclick="dismissAndQuery('Should I modify create_all_graph_components or to_pyg — which has fewer downstream consequences?')">
+          <div class="wc-ex-icon">⚖️</div>
+          <div class="wc-ex-text">Compare modifying <code>create_all_graph_components</code> vs <code>to_pyg</code>
+            <em>Design decision — structural cost comparison</em></div>
+        </div>
+      </div>
+      <div class="tour-nav">
+        <button class="tour-btn-back" onclick="tourBack()">← Back</button>
+        <button class="tour-btn-next" onclick="dismissWelcome()">Explore the graph →</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Help / glossary modal ──────────────────────────────── -->
+<div id="help-overlay" class="hidden">
+  <div class="help-box">
+    <h2>consequencegraph — glossary & shortcuts</h2>
+    <p class="help-sub">A cross-repo static analysis tool that maps ML framework contracts as graph nodes.</p>
+
+    <div class="help-section">
+      <div class="help-section-title">Core concepts</div>
+      <div class="help-term">
+        <div class="help-term-name">Impact scope</div>
+        <div class="help-term-def">All nodes that would be affected if a given function or class changes. Includes direct callers, format consumers, and transitive dependents up to the configured depth.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Tensor contract</div>
+        <div class="help-term-def">An implicit agreement between two functions about the shape, dtype, or ordering of a tensor. Unlike a Python type annotation, contracts aren't enforced by the language — they break silently at runtime.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Format contract</div>
+        <div class="help-term-def">A cross-repo coupling that exists on disk rather than in Python call graphs — e.g. the filename <code>mesh_features.pt</code> that wmg writes and neural-lam reads. No IDE can see this link; consequencegraph makes it explicit.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Lightning hook</div>
+        <div class="help-term-def">A method like <code>training_step</code> or <code>validation_step</code> whose signature is enforced by the PyTorch Lightning framework at runtime. Changing these signatures breaks training even if Python doesn't complain.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Cross-repo node</div>
+        <div class="help-term-def">A dependency that spans two repositories — in this graph, between weather-model-graphs (wmg) and neural-lam. These are the hardest couplings to spot manually.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Config key</div>
+        <div class="help-term-def">A named value (like <code>g2m</code> or <code>m2m</code>) read or written by multiple functions. Config key nodes let you trace how a hyperparameter or graph name propagates through the codebase.</div>
+      </div>
+    </div>
+
+    <div class="help-section">
+      <div class="help-section-title">Result tiers</div>
+      <div class="help-term">
+        <div class="help-term-name">Will break</div>
+        <div class="help-term-def">Nodes with a direct structural dependency on what you're changing — a call, format consumption, or hook contract. These will fail at runtime without intervention.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">Likely needs update</div>
+        <div class="help-term-def">Nodes connected via a medium-risk edge (config read, indirect call). They probably need updating but may work depending on the nature of your change.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">In scope</div>
+        <div class="help-term-def">Nodes in the broader dependency neighbourhood. Unlikely to break but worth reviewing — especially tests and documentation.</div>
+      </div>
+    </div>
+
+    <div class="help-section">
+      <div class="help-section-title">Edge types</div>
+      <div class="help-term">
+        <div class="help-term-name">produces_tensor_for</div>
+        <div class="help-term-def">This function outputs a tensor that feeds directly into the target. Shape or format changes here cascade downstream.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">consumes_format</div>
+        <div class="help-term-def">This node expects data in a specific format from the source. If the source format changes, this node breaks.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">overrides_hook</div>
+        <div class="help-term-def">PyTorch Lightning hook override — the framework enforces the signature contract. Changing it breaks the training loop.</div>
+      </div>
+      <div class="help-term">
+        <div class="help-term-name">reads_config</div>
+        <div class="help-term-def">This node reads a config key. Renaming or removing the key causes a silent <code>None</code> return rather than an exception.</div>
+      </div>
+    </div>
+
+    <div class="help-section">
+      <div class="help-section-title">Keyboard shortcuts</div>
+      <div class="help-kbd"><kbd>/</kbd> <span>Focus the search box</span></div>
+      <div class="help-kbd"><kbd>Esc</kbd> <span>Back to explorer / close this panel</span></div>
+      <div class="help-kbd"><kbd>Enter</kbd> <span>Run consequence analysis (when query box is focused)</span></div>
+      <div class="help-kbd"><kbd>↑</kbd> <span>Previous query (when query box is focused)</span></div>
+      <div class="help-kbd"><kbd>↓</kbd> <span>Next query (when query box is focused)</span></div>
+      <div class="help-kbd"><kbd>?</kbd> <span>Open this help panel</span></div>
+    </div>
+
+    <button class="help-close" onclick="toggleHelp()">Close</button>
+    <div style="clear:both"></div>
   </div>
 </div>
 
@@ -1713,6 +2159,7 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   <button id="btn-diff" onclick="loadDiff()">Diff vs main</button>
   <button id="btn-reindex" onclick="reindex()">Reindex</button>
   <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">Focus view</button>
+  <button id="btn-help" onclick="toggleHelp()" title="Glossary & keyboard shortcuts">? Help</button>
   <span id="stats-bar">loading...</span>
 </div>
 
@@ -1722,19 +2169,19 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
     <svg id="graph-svg"></svg>
     <div id="legend">
       <h4>Node types</h4>
-      <div class="legend-row"><div class="legend-dot" style="background:#58a6ff"></div>function</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#d2a8ff"></div>class</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#f0883e"></div>lightning hook</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#f85149"></div>tensor contract</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#e3b341"></div>config key</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#3fb950"></div>module</div>
-      <div class="legend-row"><div class="legend-dot" style="background:#79c0ff"></div>format contract</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#4dabf7"></div>function</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#cc5de8"></div>class</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#ff922b"></div>lightning hook</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#ff6b6b"></div>tensor contract</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#fcc419"></div>config key</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#51cf66"></div>module</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#74c0fc"></div>format contract</div>
       <div style="margin-top:8px;padding-top:8px;border-top:1px solid #21262d">
         <div style="font-size:9px;color:#6e7681;margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em">Edge types</div>
-        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#f85149;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">produces tensor</span></div>
-        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#e3b341;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">consumes format</span></div>
-        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#58a6ff;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">calls</span></div>
-        <div class="legend-row"><div style="width:18px;height:2px;background:#d2a8ff;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">inherits</span></div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#ff6b6b;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">produces tensor</span></div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#fcc419;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">consumes format</span></div>
+        <div class="legend-row" style="margin-bottom:3px"><div style="width:18px;height:2px;background:#4dabf7;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">calls</span></div>
+        <div class="legend-row"><div style="width:18px;height:2px;background:#cc5de8;flex-shrink:0"></div><span style="font-size:10px;color:#8b949e;margin-left:6px">inherits</span></div>
       </div>
     </div>
   </div>
@@ -1762,10 +2209,11 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
       <div class="query-chips">
         <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">What breaks if I change <code>to_pyg()</code>?</button>
         <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">Add tensor to <code>__getitem__</code> return tuple</button>
-        <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">⚖️ Compare <code>g2m</code> vs <code>m2m</code> impact</button>
+        <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">Compare <code>g2m</code> vs <code>m2m</code> impact</button>
       </div>
       <textarea id="consequence-query" rows="3"
         placeholder="Describe a change, design question, or idea — mention function and class names directly.&#10;e.g. 'Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple'"></textarea>
+      <div class="history-hint" id="history-hint">↑ ↓ to browse previous queries</div>
       <button id="btn-consequence" onclick="runConsequence()">Analyse consequences →</button>
     </div>
   </div>
@@ -1773,14 +2221,14 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 
 <script>
 const NODE_COLORS = {
-  function: '#58a6ff',
-  class: '#d2a8ff',
-  module: '#3fb950',
-  config_key: '#e3b341',
-  tensor_contract: '#f85149',
-  lightning_hook: '#f0883e',
-  data_format: '#79c0ff',
-  unknown: '#8b949e',
+  function:         '#4dabf7',   // bright sky blue
+  class:            '#cc5de8',   // vivid purple
+  module:           '#51cf66',   // bright green
+  config_key:       '#fcc419',   // warm amber
+  tensor_contract:  '#ff6b6b',   // bright coral red
+  lightning_hook:   '#ff922b',   // vivid orange
+  data_format:      '#74c0fc',   // light blue
+  unknown:          '#868e96',   // neutral grey
 };
 
 // Cross-repo format contract nodes coloured by mismatch risk (wmg preset)
@@ -1791,17 +2239,17 @@ const MISMATCH_COLORS = {
 };
 
 const EDGE_COLORS = {
-  calls: '#58a6ff',
-  inherits: '#d2a8ff',
-  produces_tensor_for: '#f85149',
-  overrides_hook: '#f0883e',
-  consumes_format: '#e3b341',
-  reads_config: '#3fb950',
-  writes_config: '#56d364',
-  named_reference: '#8b949e',
-  imports: '#21262d',
-  defined_in: '#21262d',
-  instantiates: '#79c0ff',
+  calls:               '#4dabf7',   // sky blue
+  inherits:            '#cc5de8',   // purple
+  produces_tensor_for: '#ff6b6b',   // coral red
+  overrides_hook:      '#ff922b',   // orange
+  consumes_format:     '#fcc419',   // amber
+  reads_config:        '#51cf66',   // green
+  writes_config:       '#69db7c',   // light green
+  named_reference:     '#868e96',   // grey
+  imports:             '#343a40',   // dark — structural noise
+  defined_in:          '#343a40',   // dark — structural noise
+  instantiates:        '#74c0fc',   // light blue
 };
 
 // H1: HTML-escape — applied to all server-sourced data before innerHTML
@@ -1814,7 +2262,7 @@ let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
 let currentZoom = 1;
 let zoomBehavior = null;
-let viewMode = 'focus';          // 'focus' | 'full'
+let viewMode = 'full';           // 'focus' | 'full'
 let visibleNodeIds = new Set();  // controls which nodes are shown in focus mode
 let W = 0, H = 0;
 
@@ -1909,6 +2357,14 @@ function renderGraph() {
 
   // Arrow markers
   const defs = svg.append('defs');
+
+  // Glow filter for high-degree hub nodes
+  const glow = defs.append('filter').attr('id', 'node-glow').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
+  glow.append('feGaussianBlur').attr('stdDeviation', '3').attr('result', 'blur');
+  const merge = glow.append('feMerge');
+  merge.append('feMergeNode').attr('in', 'blur');
+  merge.append('feMergeNode').attr('in', 'SourceGraphic');
+
   Object.entries(EDGE_COLORS).forEach(([type, color]) => {
     defs.append('marker')
       .attr('id', `arrow-${type}`)
@@ -1919,15 +2375,15 @@ function renderGraph() {
       .append('path')
       .attr('d', 'M0,-4L8,0L0,4')
       .attr('fill', color)
-      .attr('opacity', 0.6);
+      .attr('opacity', 0.7);
   });
 
-  // Links
+  // Links — higher opacity, min stroke-width so thin edges are visible
   linkEl = g.append('g').selectAll('line')
     .data(validEdges).enter().append('line')
     .attr('class', 'link')
-    .attr('stroke', d => EDGE_COLORS[d.type] || '#444')
-    .attr('stroke-width', d => Math.max(0.5, d.severity_weight * 0.5))
+    .attr('stroke', d => EDGE_COLORS[d.type] || '#555')
+    .attr('stroke-width', d => Math.max(1.0, d.severity_weight * 0.6))
     .attr('marker-end', d => `url(#arrow-${d.type})`);
 
   // Nodes
@@ -1958,20 +2414,25 @@ function renderGraph() {
   nodeEl = nodeGroup;
 
   nodeGroup.append('circle')
-    .attr('r', d => Math.max(4, Math.min(14, 3 + d.in_degree * 0.6)))
+    .attr('r', d => Math.max(5, Math.min(18, 4 + d.in_degree * 0.9)))
     .attr('fill', d => {
-      // Cross-repo format contract nodes: colour by mismatch risk
       if (d.is_cross_repo && d.mismatch_risk && MISMATCH_COLORS[d.mismatch_risk]) {
         return MISMATCH_COLORS[d.mismatch_risk];
       }
       return NODE_COLORS[d.type] || '#8b949e';
     })
+    .attr('fill-opacity', d => {
+      // High-degree hubs are fully opaque; peripheral nodes slightly translucent
+      return Math.min(1.0, 0.7 + (d.in_degree || 0) * 0.03);
+    })
     .attr('stroke', d => {
-      if (d.is_lossiness_boundary) return '#f85149';  // red ring on from_networkx
-      if (d.is_cross_repo) return '#ffffff';           // white ring on contract nodes
+      if (d.is_lossiness_boundary) return '#f85149';
+      if (d.is_cross_repo) return '#ffffff';
       return d.is_lightning_hook ? '#f0883e' : (NODE_COLORS[d.type] || '#8b949e');
     })
-    .attr('stroke-opacity', 0.8);
+    .attr('stroke-opacity', 0.9)
+    .attr('stroke-width', d => d.is_cross_repo || d.is_lightning_hook ? 2 : 1.2)
+    .attr('filter', d => (d.in_degree || 0) >= 3 ? 'url(#node-glow)' : null);
 
   labelEl = nodeGroup.append('text')
     .attr('class', 'node-label')
@@ -1996,12 +2457,8 @@ function renderGraph() {
     .force('collision', d3.forceCollide(d => Math.max(12, 6 + d.in_degree * 1.5)))
     .on('tick', ticked);
 
-  // Apply initial focus visibility after first tick so D3 has bound data
-  simulation.on('end.focus', () => {
-    visibleNodeIds = computeDefaultFocus();
-    applyFocusVisibility();
-    simulation.on('end.focus', null); // run once only
-  });
+  // Focus on load is skipped — default is full graph view.
+  // Focus activates when user clicks a node or toggles manually.
 }
 
 function ticked() {
@@ -2145,11 +2602,51 @@ async function prefillConsequenceContext(nodeId) {
   }
 }
 
+function showConsequenceError(errorData, query) {
+  const title = errorData.error || 'Something went wrong';
+  const hint  = errorData.hint  || '';
+  const suggestions = errorData.suggestions || [];
+
+  let html = `<div class="cq-error-card">
+    <div class="cq-error-title">${_h(title)}</div>`;
+  if (hint) html += `<div class="cq-error-hint">${_h(hint)}</div>`;
+  if (suggestions.length) {
+    html += `<div class="cq-error-suggestions">Did you mean one of these?</div>`;
+    suggestions.forEach(s => {
+      const fname = (s.file || '').split(/[/\\]/).pop();
+      html += `<button class="cq-suggestion-btn"
+        onclick="fillQueryFromSuggestion('${_h(s.id)}','${_h(s.name)}')"
+        title="${_h(s.id)}">
+        ${_h(s.name)}
+        ${fname ? `<span class="cq-suggestion-file"> — ${_h(fname)}</span>` : ''}
+      </button>`;
+    });
+  }
+  html += `</div>`;
+
+  document.getElementById('sidebar-title').textContent = 'Consequence analysis';
+  document.getElementById('sidebar-content').innerHTML =
+    `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>` + html;
+}
+
+function fillQueryFromSuggestion(nodeId, name) {
+  const ta = document.getElementById('consequence-query');
+  // Insert the node name at cursor position or append
+  const prev = ta.value.trim();
+  ta.value = prev ? `${prev} — what breaks if I change ${name}?` : `What breaks if I change ${name}?`;
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
 async function runConsequence() {
   const ta   = document.getElementById('consequence-query');
   const query = ta.value.trim();
-  if (!query) { alert('Describe a change, idea, or design question first.'); return; }
+  if (!query) {
+    showConsequenceError({ error: 'No query entered.', hint: 'Describe a change, design question, or idea — mention function and class names directly.' });
+    return;
+  }
 
+  pushHistory(query);
   const anchorId = ta.dataset.anchorId || null;
   const btn = document.getElementById('btn-consequence');
   btn.textContent = 'Analysing…';
@@ -2162,11 +2659,14 @@ async function runConsequence() {
       body:    JSON.stringify({ query, anchor_node_id: anchorId }),
     });
     const data = await resp.json();
-    if (data.error) { alert(data.error + (data.hint ? '\n\n' + data.hint : '')); return; }
+    if (data.error) {
+      showConsequenceError(data, query);
+      return;
+    }
     renderConsequenceSidebar(data);
     highlightConsequenceNodes(data);
   } catch(e) {
-    alert('Request failed: ' + e.message);
+    showConsequenceError({ error: 'Request failed.', hint: e.message });
   } finally {
     btn.textContent = 'Analyse consequences →';
     btn.disabled = false;
@@ -2181,12 +2681,12 @@ function renderConsequenceSidebar(data) {
     exploration:     'Exploration',
   };
   const changeLabels = {
-    return_format_change:  '⟳ Return format',
-    signature_change:      '⟨⟩ Signature',
+    return_format_change:  'Return format',
+    signature_change:      'Signature',
     dimension_change:      'Dimension',
-    rename:                '✎ Rename',
-    removal:               '✕ Removal',
-    add_tensor_component:  '⊕ New tensor',
+    rename:                'Rename',
+    removal:               'Removal',
+    add_tensor_component:  'New tensor',
     config_change:         '⚙ Config',
     modification:          '~ Modification',
   };
@@ -2354,7 +2854,7 @@ function renderConsequenceSidebar(data) {
         <div class="tier-header">
           <span class="tier-label t1">Will break</span>
           <span style="font-size:10px;color:#f85149;opacity:.6">${data.will_break.length} node${data.will_break.length > 1 ? 's' : ''}</span>
-          <span class="tier-action t1">must address</span>
+          <span class="tier-action t1">must fix</span>
         </div>`;
       data.will_break.forEach(n => { html += renderCqNode(n, 1); });
       html += `</div>`;
@@ -2364,21 +2864,21 @@ function renderConsequenceSidebar(data) {
     if (data.likely_need && data.likely_need.length) {
       html += `<div class="tier-section">
         <div class="tier-header">
-          <span class="tier-label t2">Likely need</span>
+          <span class="tier-label t2">Likely needs update</span>
           <span style="font-size:10px;color:#6e7681">${data.likely_need.length} node${data.likely_need.length > 1 ? 's' : ''}</span>
-          <span class="tier-action">verify before shipping</span>
+          <span class="tier-action">review before shipping</span>
         </div>`;
       data.likely_need.forEach(n => { html += renderCqNode(n, 2); });
       html += `</div>`;
     }
 
-    // ── Tier 3: be aware ─────────────────────────────────────
+    // ── Tier 3: in scope ──────────────────────────────────────
     if (data.be_aware && data.be_aware.length) {
       html += `<div class="tier-section">
         <div class="tier-header">
-          <span class="tier-label t3">Be aware</span>
+          <span class="tier-label t3">In scope</span>
           <span style="font-size:10px;color:#6e7681">${data.be_aware.length} node${data.be_aware.length > 1 ? 's' : ''}</span>
-          <span class="tier-action">in blast radius</span>
+          <span class="tier-action">broader impact area</span>
         </div>`;
       data.be_aware.forEach(n => { html += renderCqNode(n, 3); });
       html += `</div>`;
@@ -2390,9 +2890,13 @@ function renderConsequenceSidebar(data) {
   }
 
   document.getElementById('sidebar-title').textContent = 'Consequence analysis';
-  // Prepend a back button so user can return to the graph explorer view
-  html = `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>` + html;
+  // Prepend back button + copy-markdown button
+  const copyBtn = `<button class="copy-md-btn" id="btn-copy-md">Copy as Markdown</button>`;
+  html = `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>${copyBtn}` + html;
   document.getElementById('sidebar-content').innerHTML = html;
+  // Wire copy button after DOM insertion — store data on element to avoid closure issues
+  const copyEl = document.getElementById('btn-copy-md');
+  if (copyEl) copyEl.onclick = () => copyAsMarkdown(copyEl, data);
 }
 
 function renderCqNode(n, tier) {
@@ -2409,7 +2913,7 @@ function renderCqNode(n, tier) {
 
   // Severity dot colour per tier
   const dotColor = tier === 1 ? '#f85149' : tier === 2 ? '#e3b341' : '#6e7681';
-  const pillLabel = tier === 1 ? 'breaks' : tier === 2 ? 'check' : 'aware';
+  const pillLabel = tier === 1 ? 'breaks' : tier === 2 ? 'review' : 'in scope';
 
   // Badges for detail row
   const hookBadge = n.is_hook
@@ -2481,10 +2985,11 @@ function backToExplore() {
       <div id="hot-nodes-list"><div style="color:#6e7681;font-size:11px">Loading...</div></div>
     </div>`;
   selectedNodeId = null;
-  // Restore default focus view
+  // Restore all nodes to visible — we're back in full graph mode
   if (viewMode === 'focus') {
-    visibleNodeIds = computeDefaultFocus();
+    viewMode = 'full';
     applyFocusVisibility();
+    updateStatsBar();
   }
   // Reload hot nodes
   loadHotNodes();
@@ -2576,7 +3081,12 @@ async function loadDiff() {
   const resp = await fetch('/api/diff?base=main');
   const data = await resp.json();
   if (!data.impacts.length) {
-    alert('No changed Python functions found vs main branch.');
+    document.getElementById('sidebar-title').textContent = 'Diff vs main';
+    document.getElementById('sidebar-content').innerHTML = `
+      <div class="cq-error-card" style="border-color:#30363d;background:#161b22">
+        <div class="cq-error-title" style="color:#8b949e">No changes detected</div>
+        <div class="cq-error-hint">No modified Python functions found vs main branch. Commit or stage some changes first.</div>
+      </div>`;
     return;
   }
   let html = `<div style="color:#8b949e;font-size:11px;margin-bottom:10px">
@@ -2712,11 +3222,38 @@ const EDGE_TOOLTIP_TEXT = {
   instantiates:        "This node creates an instance of the target class.",
 };
 
+// ── 3-step tour ───────────────────────────────────────────────────────────────
+
+let _tourStep = 0;
+const _TOUR_STEPS = 3;
+
+function tourGoto(step) {
+  // Update slides
+  document.querySelectorAll('.tour-slide').forEach((el, i) => {
+    el.classList.toggle('active', i === step);
+  });
+  // Update dots
+  document.querySelectorAll('.tour-step-dot').forEach((el, i) => {
+    el.classList.toggle('active', i === step);
+    el.classList.toggle('done', i < step);
+  });
+  document.getElementById('tour-step-label').textContent = `Step ${step + 1} of ${_TOUR_STEPS}`;
+  _tourStep = step;
+}
+
+function tourNext() {
+  if (_tourStep < _TOUR_STEPS - 1) tourGoto(_tourStep + 1);
+  else dismissWelcome();
+}
+
+function tourBack() {
+  if (_tourStep > 0) tourGoto(_tourStep - 1);
+}
+
 function dismissWelcome() {
   const overlay = document.getElementById('welcome-overlay');
   overlay.style.animation = 'fadeOut 0.2s ease forwards';
   setTimeout(() => overlay.classList.add('hidden'), 200);
-  // Add fade-out keyframe dynamically
   if (!document.getElementById('fadeout-style')) {
     const s = document.createElement('style');
     s.id = 'fadeout-style';
@@ -2740,6 +3277,15 @@ function dismissAndQuery(queryText) {
     runConsequence();
   }, 300);
 }
+
+// ── Keep-alive ping (prevents Render free tier from spinning down) ─────────────
+// Render spins down after 15 min of inactivity. Ping /api/stats every 10 min.
+(function startKeepAlive() {
+  const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+  setInterval(async () => {
+    try { await fetch('/api/stats'); } catch (_) { /* silent */ }
+  }, INTERVAL_MS);
+})();
 
 function fillQuery(text) {
   const ta = document.getElementById('consequence-query');
@@ -2786,6 +3332,185 @@ async function loadHotNodes() {
       <span class="hot-node-sev hot-sev-${_h(n.severity)}">${_h(n.severity)}</span>
     </div>`).join('');
 }
+
+// ── Help modal ────────────────────────────────────────────────────────────────
+
+function toggleHelp() {
+  const overlay = document.getElementById('help-overlay');
+  overlay.classList.toggle('hidden');
+}
+
+// ── Copy as Markdown ──────────────────────────────────────────────────────────
+
+function buildMarkdown(data) {
+  const lines = [];
+  const lead = data.lead || {};
+
+  lines.push(`## Consequence analysis`);
+  lines.push(`> Query: *${data.query}*`);
+  lines.push('');
+
+  if (lead.format === 'decision' && lead.recommendation) {
+    lines.push(`### Decision`);
+    // strip backtick-code to plain text for markdown
+    lines.push(lead.recommendation.replace(/`([^`]+)`/g, '`$1`'));
+    if (lead.options && lead.options.length) {
+      lines.push('');
+      const sorted = [...lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
+      sorted.forEach((opt, i) => {
+        const marker = i === 0 ? '✅' : '❌';
+        lines.push(`- ${marker} **${opt.name}** — ${opt.downstream_count} nodes in impact scope`);
+      });
+    }
+  } else if (lead.summary) {
+    lines.push(lead.summary.replace(/`([^`]+)`/g, '`$1`'));
+  }
+
+  lines.push('');
+
+  const tiers = [
+    { key: 'will_break',  label: 'Will break — must fix' },
+    { key: 'likely_need', label: 'Likely needs update — review before shipping' },
+    { key: 'be_aware',    label: 'In scope — broader impact area' },
+  ];
+
+  for (const { key, label } of tiers) {
+    if (data[key] && data[key].length) {
+      lines.push(`### ${label}`);
+      data[key].forEach(n => {
+        const fname = (n.file || '').split(/[/\\]/).pop();
+        const loc = fname ? ` (${fname}${n.line ? ':' + n.line : ''})` : '';
+        lines.push(`- **\`${n.name}\`**${loc}`);
+        if (n.consequence) {
+          lines.push(`  ${n.consequence}`);
+        }
+      });
+      lines.push('');
+    }
+  }
+
+  lines.push(`---`);
+  lines.push(`*Generated by [consequencegraph](https://github.com/Raj-Taware/consequence_graph)*`);
+  return lines.join('\n');
+}
+
+function copyAsMarkdown(btn, data) {
+  const md = buildMarkdown(data);
+  navigator.clipboard.writeText(md).then(() => {
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = 'Copy as Markdown';
+      btn.classList.remove('copied');
+    }, 2000);
+  }).catch(() => {
+    // Fallback for non-HTTPS environments
+    const ta = document.createElement('textarea');
+    ta.value = md;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy as Markdown'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+// ── Query history ─────────────────────────────────────────────────────────────
+
+const HISTORY_KEY = 'cq_query_history';
+const HISTORY_MAX = 8;
+let historyIndex = -1;
+
+function getHistory() {
+  try { return JSON.parse(sessionStorage.getItem(HISTORY_KEY) || '[]'); }
+  catch { return []; }
+}
+
+function pushHistory(query) {
+  if (!query.trim()) return;
+  const h = getHistory().filter(q => q !== query);
+  h.unshift(query);
+  sessionStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, HISTORY_MAX)));
+  historyIndex = -1;
+}
+
+function navigateHistory(direction) {
+  const h = getHistory();
+  if (!h.length) return;
+  const ta = document.getElementById('consequence-query');
+  if (direction === 'up') {
+    historyIndex = Math.min(historyIndex + 1, h.length - 1);
+  } else {
+    historyIndex = Math.max(historyIndex - 1, -1);
+  }
+  ta.value = historyIndex >= 0 ? h[historyIndex] : '';
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement?.tagName;
+  const inInput = tag === 'INPUT' || tag === 'TEXTAREA';
+  const cqFocused = document.activeElement?.id === 'consequence-query';
+  const searchFocused = document.activeElement?.id === 'search-box';
+
+  // ? — open help (only when not typing)
+  if (e.key === '?' && !inInput) {
+    e.preventDefault();
+    toggleHelp();
+    return;
+  }
+
+  // Esc — close help, or back to explorer
+  if (e.key === 'Escape') {
+    const help = document.getElementById('help-overlay');
+    if (!help.classList.contains('hidden')) { toggleHelp(); return; }
+    if (!inInput) backToExplore();
+    if (cqFocused || searchFocused) document.activeElement.blur();
+    return;
+  }
+
+  // / — focus search box
+  if (e.key === '/' && !inInput) {
+    e.preventDefault();
+    document.getElementById('search-box').focus();
+    return;
+  }
+
+  // Inside consequence query textarea
+  if (cqFocused) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      runConsequence();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      navigateHistory('up');
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      navigateHistory('down');
+      return;
+    }
+  }
+});
+
+// Show history hint when textarea is focused and history exists
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('consequence-query');
+  const hint = document.getElementById('history-hint');
+  if (ta && hint) {
+    ta.addEventListener('focus', () => {
+      if (getHistory().length > 0) hint.classList.add('visible');
+    });
+    ta.addEventListener('blur', () => hint.classList.remove('visible'));
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
