@@ -85,8 +85,6 @@ def get_engine() -> QueryEngine:
 def build_or_load_graph(path: str, preset: str = None, force_reindex: bool = False):
     global _graph, _engine, _index_path
     _index_path = os.path.abspath(path)
-    if not os.path.isdir(_index_path):  # C1: Path traversal protection
-        raise RuntimeError(f"Index path does not exist or is not a directory: {_index_path}")
     # C4: prefer <path>/cache.json (pre-built on Render); fall back to dev-mode path
     _path_cache = os.path.join(_index_path, "cache.json")
     cache = _path_cache if os.path.isfile(_path_cache) else os.path.join(os.getcwd(), ".consequencegraph", "cache.json")
@@ -1327,9 +1325,8 @@ def api_diff(base: str = Query("main", max_length=100)):  # C1: validate before 
             capture_output=True, text=True, cwd=_index_path
         )
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.endswith(".py")]
-    except Exception as e:
-        msg = "Git operation failed." if PRODUCTION else str(e).replace(_index_path, "<index_path>")
-        raise HTTPException(status_code=500, detail=msg)  # M2
+    except Exception:
+        raise HTTPException(status_code=500, detail="Git operation failed.")  # M2
 
     if not changed_files:
         return {"changed_files": [], "impacts": []}
@@ -1734,6 +1731,50 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
   .cq-suggestion-file { color: #6e7681; font-family: inherit; font-size: 10px; }
 
   /* Back to explorer button */
+  /* ── Path trace overlay ─────────────────────────────────── */
+  #path-trace-bar {
+    position: absolute; top: 52px; left: 50%; transform: translateX(-50%);
+    background: rgba(22,27,34,0.96); border: 1px solid #3fb950;
+    border-radius: 8px; padding: 8px 16px; font-size: 11px; color: #3fb950;
+    display: none; z-index: 100; white-space: nowrap;
+    box-shadow: 0 4px 20px rgba(63,185,80,0.2);
+  }
+  #path-trace-bar.visible { display: block; }
+  #path-trace-bar button {
+    margin-left: 10px; padding: 3px 10px; background: #3fb950; border: none;
+    border-radius: 4px; color: #0d1117; font-size: 10px; font-weight: 700;
+    cursor: pointer; font-family: inherit;
+  }
+  .path-edge { stroke: #3fb950 !important; stroke-opacity: 1 !important; stroke-width: 3px !important; }
+  .path-node circle { filter: drop-shadow(0 0 8px #3fb950) brightness(1.6) !important; }
+
+  /* ── Follow-up suggestion chips ─────────────────────────── */
+  .followup-section { margin-top: 14px; padding-top: 12px; border-top: 1px solid #21262d; }
+  .followup-label { font-size: 9px; color: #6e7681; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 7px; }
+  .followup-chip {
+    display: block; width: 100%; text-align: left;
+    background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+    padding: 7px 11px; margin-bottom: 5px; cursor: pointer;
+    font-size: 11px; color: #8b949e; font-family: inherit;
+    transition: border-color 0.12s, color 0.12s; line-height: 1.4;
+  }
+  .followup-chip:hover { border-color: #3fb950; color: #c9d1d9; }
+  .followup-chip .fc-icon { margin-right: 5px; }
+
+  /* ── Inline "why?" explanation ───────────────────────────── */
+  .cq-why-btn {
+    font-size: 9px; color: #6e7681; background: none; border: none;
+    cursor: pointer; padding: 0 0 0 6px; font-family: inherit;
+    transition: color 0.12s;
+  }
+  .cq-why-btn:hover { color: #79c0ff; }
+  .cq-why-expanded {
+    font-size: 10px; color: #8b949e; line-height: 1.6;
+    background: #0d1117; border-radius: 4px; padding: 6px 8px;
+    margin-top: 5px; display: none; border-left: 2px solid #30363d;
+  }
+  .cq-why-expanded.open { display: block; }
+
   .back-btn {
     display: inline-flex; align-items: center; gap: 5px;
     font-size: 10px; color: #6e7681; background: none; border: none;
@@ -1959,6 +2000,12 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 <body>
 
 <!-- ── Welcome overlay ────────────────────────────────────── -->
+<!-- ── Path trace status bar ──────────────────────────────── -->
+<div id="path-trace-bar">
+  <span id="path-trace-msg">⇢ Shift-click a second node to trace path</span>
+  <button onclick="clearPathTrace()">✕ Clear</button>
+</div>
+
 <div id="welcome-overlay">
   <div class="tour-box">
 
@@ -2073,7 +2120,7 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 <!-- ── Help / glossary modal ──────────────────────────────── -->
 <div id="help-overlay" class="hidden">
   <div class="help-box">
-    <h2>consequencegraph — glossary & shortcuts</h2>
+    <h2>⬡ consequencegraph — glossary & shortcuts</h2>
     <p class="help-sub">A cross-repo static analysis tool that maps ML framework contracts as graph nodes.</p>
 
     <div class="help-section">
@@ -2156,12 +2203,12 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="topbar">
-  <h1>consequencegraph</h1>
+  <h1>⬡ consequencegraph</h1>
   <input id="search-box" type="text" placeholder="Search nodes... (function, class, module)" autocomplete="off">
   <div id="search-results"></div>
-  <button id="btn-diff" onclick="loadDiff()">Diff vs main</button>
-  <button id="btn-reindex" onclick="reindex()">Reindex</button>
-  <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">Focus view</button>
+  <button id="btn-diff" onclick="loadDiff()">⎇ Diff vs main</button>
+  <button id="btn-reindex" onclick="reindex()">↺ Reindex</button>
+  <button id="btn-view-toggle" onclick="toggleViewMode()" title="Switch between focused and full graph view">◎ Focus view</button>
   <button id="btn-help" onclick="toggleHelp()" title="Glossary & keyboard shortcuts">? Help</button>
   <span id="stats-bar">loading...</span>
 </div>
@@ -2205,14 +2252,14 @@ _FRONTEND_HTML = r"""<!DOCTYPE html>
     </div>
     <div id="consequence-panel">
       <div class="panel-label">
-        View Consequence
+        ⚡ View Consequence
         <span id="cq-hint">click a node to pre-fill context</span>
       </div>
       <div class="query-chip-label">Example queries</div>
       <div class="query-chips">
-        <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">What breaks if I change <code>to_pyg()</code>?</button>
-        <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">Add tensor to <code>__getitem__</code> return tuple</button>
-        <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">Compare <code>g2m</code> vs <code>m2m</code> impact</button>
+        <button class="query-chip" onclick="fillQuery('What breaks in neural-lam if I change to_pyg output format?')">🔴 What breaks if I change <code>to_pyg()</code>?</button>
+        <button class="query-chip" onclick="fillQuery('Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple')">⚡ Add tensor to <code>__getitem__</code> return tuple</button>
+        <button class="query-chip" onclick="fillQuery('Should I modify g2m or m2m — which has fewer downstream consequences?')">⚖️ Compare <code>g2m</code> vs <code>m2m</code> impact</button>
       </div>
       <textarea id="consequence-query" rows="3"
         placeholder="Describe a change, design question, or idea — mention function and class names directly.&#10;e.g. 'Add a spatial weight tensor to WeatherDataset.__getitem__ return tuple'"></textarea>
@@ -2263,6 +2310,7 @@ function _h(s) {
 
 let allNodes = [], allEdges = [], simulation, svg, g, nodeEl, linkEl, labelEl;
 let selectedNodeId = null;
+let pathTraceTarget = null;  // second node for path tracing (shift-click)
 let currentZoom = 1;
 let zoomBehavior = null;
 let viewMode = 'full';           // 'focus' | 'full'
@@ -2405,16 +2453,67 @@ function renderGraph() {
       .on('drag', (e, d) => {
         dragMoved = true;
         d.fx = e.x; d.fy = e.y;
+        // Repulsion: push nearby nodes away from drag point
+        allNodes.forEach(n => {
+          if (n.id === d.id) return;
+          const dx = n.x - e.x, dy = n.y - e.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < 80 && dist > 0) {
+            const force = (80 - dist) / 80 * 18;
+            n.vx = (n.vx || 0) + (dx / dist) * force;
+            n.vy = (n.vy || 0) + (dy / dist) * force;
+          }
+        });
       })
       .on('end', (e, d) => {
-        if (!e.active) simulation.alphaTarget(0);
+        if (!e.active) {
+          // Give momentum: don't snap to 0 alphaTarget instantly
+          simulation.alphaTarget(0.05);
+          setTimeout(() => simulation.alphaTarget(0), 600);
+        }
         d.fx = null; d.fy = null;
-        // Only fire select if this was a click, not a drag
-        if (!dragMoved) selectNode(d);
+        if (!dragMoved) selectNode(d, e.sourceEvent?.shiftKey || false);
       })
     );
 
   nodeEl = nodeGroup;
+
+  // ── Hover ripple: brighten neighbours + pulse edges on hover ──
+  nodeGroup
+    .on('mouseover', (e, d) => {
+      if (selectedNodeId) return; // don't interfere when a node is selected
+      const neighbourIds = new Set();
+      allEdges.forEach(edge => {
+        const srcId = edge.source?.id ?? edge.source;
+        const tgtId = edge.target?.id ?? edge.target;
+        if (srcId === d.id) neighbourIds.add(tgtId);
+        if (tgtId === d.id) neighbourIds.add(srcId);
+      });
+      nodeEl.selectAll('circle')
+        .style('opacity', n => n.id === d.id || neighbourIds.has(n.id) ? 1 : 0.25)
+        .style('filter', n => neighbourIds.has(n.id)
+          ? 'brightness(1.25) drop-shadow(0 0 4px currentColor)' : null);
+      linkEl
+        .style('stroke-opacity', edge => {
+          const s = edge.source?.id ?? edge.source;
+          const t = edge.target?.id ?? edge.target;
+          return (s === d.id || t === d.id) ? 1.0 : 0.06;
+        })
+        .style('stroke-width', edge => {
+          const s = edge.source?.id ?? edge.source;
+          const t = edge.target?.id ?? edge.target;
+          return (s === d.id || t === d.id)
+            ? Math.max(1.5, (edge.severity_weight || 0) * 0.8) : null;
+        });
+    })
+    .on('mouseout', () => {
+      if (selectedNodeId) return;
+      nodeEl.selectAll('circle')
+        .style('opacity', null).style('filter', null);
+      linkEl
+        .style('stroke-opacity', null)
+        .style('stroke-width', null);
+    });
 
   nodeGroup.append('circle')
     .attr('r', d => Math.max(5, Math.min(18, 4 + d.in_degree * 0.9)))
@@ -2471,7 +2570,34 @@ function ticked() {
   nodeEl.attr('transform', d => `translate(${d.x},${d.y})`);
 }
 
-async function selectNode(d) {
+async function selectNode(d, shiftKey = false) {
+  // ── Path tracing: shift-click sets second node ────────────
+  if (shiftKey && selectedNodeId && selectedNodeId !== d.id) {
+    pathTraceTarget = d.id;
+    const path = bfsPath(selectedNodeId, d.id);
+    if (path.length) {
+      animatePath(path);
+    } else {
+      document.getElementById('path-trace-msg').textContent =
+        `No direct path found from ${selectedNodeId.split('.').pop()} to ${d.name}`;
+      document.getElementById('path-trace-bar').classList.add('visible');
+    }
+    return;
+  }
+
+  // First node: enter path-trace mode
+  if (shiftKey) {
+    selectedNodeId = d.id;
+    document.getElementById('path-trace-msg').textContent =
+      `⇢ Shift-click a second node to trace path from ${d.name}`;
+    document.getElementById('path-trace-bar').classList.add('visible');
+    nodeEl.classed('path-node', n => n.id === d.id);
+    return;
+  }
+
+  // Clear path trace if normal click
+  clearPathTrace();
+
   selectedNodeId = d.id;
   document.getElementById('sidebar-title').textContent = d.name;
 
@@ -2503,24 +2629,24 @@ async function selectNode(d) {
 function renderImpactSidebar(node, impact) {
   const br = impact.blast_radius || {};
   const meta = impact.target_meta || {};
-  const sev = _h(impact.severity || 'low');
+  const sev = impact.severity || 'low';
 
   let html = `
     <div class="meta-row">
-      <span class="meta-pill">${_h(meta.type || node.type)}</span>
-      ${meta.is_lightning_hook ? '<span class="meta-pill hook">Lightning hook</span>' : ''}
+      <span class="meta-pill">${meta.type || node.type}</span>
+      ${meta.is_lightning_hook ? '<span class="meta-pill hook">⚡ Lightning hook</span>' : ''}
       <span class="severity-badge sev-${sev}">${sev}</span>
     </div>`;
 
   if (meta.file) {
     const fname = meta.file.split(/[\/\\]/).pop();
-    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${_h(fname)}:${_h(meta.line || 0)}</div>`;
+    html += `<div style="color:#8b949e;font-size:10px;margin-top:4px">${fname}:${meta.line || 0}</div>`;
   }
   if (meta.signature) {
-    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${_h(node.name)}${_h(meta.signature)}</div>`;
+    html += `<div style="color:#79c0ff;font-size:11px;margin-top:6px;font-family:'SF Mono',monospace">${node.name}${meta.signature}</div>`;
   }
   if (meta.docstring) {
-    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${_h(meta.docstring)}</div>`;
+    html += `<div style="color:#6e7681;font-size:10px;margin-top:5px;line-height:1.5">${meta.docstring}</div>`;
   }
 
   // Tensor shapes
@@ -2539,13 +2665,13 @@ function renderImpactSidebar(node, impact) {
     html += `</div>`;
   }
 
-  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${_h(impact.llm_context_hint || '')}</div>`;
+  html += `<div style="color:#8b949e;font-size:10px;margin-top:10px">${impact.llm_context_hint || ''}</div>`;
 
   // Critical path
   if (impact.critical_path && impact.critical_path.length > 1) {
     html += `<div class="impact-section"><h3>Critical path</h3>
       <div style="font-size:10px;color:#8b949e;word-break:break-all">
-        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${_h(n.split('.').pop())}</span>`).join(' → ')}
+        ${impact.critical_path.map(n => `<span style="color:#79c0ff">${n.split('.').pop()}</span>`).join(' → ')}
       </div></div>`;
   }
 
@@ -2611,7 +2737,7 @@ function showConsequenceError(errorData, query) {
   const suggestions = errorData.suggestions || [];
 
   let html = `<div class="cq-error-card">
-    <div class="cq-error-title">${_h(title)}</div>`;
+    <div class="cq-error-title">⚠ ${_h(title)}</div>`;
   if (hint) html += `<div class="cq-error-hint">${_h(hint)}</div>`;
   if (suggestions.length) {
     html += `<div class="cq-error-suggestions">Did you mean one of these?</div>`;
@@ -2627,7 +2753,7 @@ function showConsequenceError(errorData, query) {
   }
   html += `</div>`;
 
-  document.getElementById('sidebar-title').textContent = 'Consequence analysis';
+  document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
   document.getElementById('sidebar-content').innerHTML =
     `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>` + html;
 }
@@ -2684,12 +2810,12 @@ function renderConsequenceSidebar(data) {
     exploration:     'Exploration',
   };
   const changeLabels = {
-    return_format_change:  'Return format',
-    signature_change:      'Signature',
-    dimension_change:      'Dimension',
-    rename:                'Rename',
-    removal:               'Removal',
-    add_tensor_component:  'New tensor',
+    return_format_change:  '⟳ Return format',
+    signature_change:      '⟨⟩ Signature',
+    dimension_change:      '⊞ Dimension',
+    rename:                '✎ Rename',
+    removal:               '✕ Removal',
+    add_tensor_component:  '⊕ New tensor',
     config_change:         '⚙ Config',
     modification:          '~ Modification',
   };
@@ -2892,9 +3018,11 @@ function renderConsequenceSidebar(data) {
     }
   }
 
-  document.getElementById('sidebar-title').textContent = 'Consequence analysis';
+  document.getElementById('sidebar-title').textContent = '⚡ Consequence analysis';
+  // Append follow-up suggestions
+  html += renderFollowUps(data);
   // Prepend back button + copy-markdown button
-  const copyBtn = `<button class="copy-md-btn" id="btn-copy-md">Copy as Markdown</button>`;
+  const copyBtn = `<button class="copy-md-btn" id="btn-copy-md">⎘ Copy as Markdown</button>`;
   html = `<button class="back-btn" onclick="backToExplore()">← Back to explorer</button>${copyBtn}` + html;
   document.getElementById('sidebar-content').innerHTML = html;
   // Wire copy button after DOM insertion — store data on element to avoid closure issues
@@ -2920,7 +3048,7 @@ function renderCqNode(n, tier) {
 
   // Badges for detail row
   const hookBadge = n.is_hook
-    ? `<span class="cq-badge hook-badge">hook<span class="badge-tip">PyTorch Lightning hook — the framework enforces this signature contract at runtime.</span></span>`
+    ? `<span class="cq-badge hook-badge">⚡ hook<span class="badge-tip">PyTorch Lightning hook — the framework enforces this signature contract at runtime.</span></span>`
     : '';
   const shapesBadge = n.shapes && Object.keys(n.shapes).length
     ? `<span class="cq-badge shape-badge">shapes<span class="badge-tip">This node has known tensor shape contracts.</span></span>`
@@ -2936,6 +3064,16 @@ function renderCqNode(n, tier) {
   const viaNote = via
     ? `<span class="cq-meta-item">via ${via}</span>` : '';
 
+  // Why chain: first reason path
+  const whyChain = n.reasons && n.reasons.length
+    ? n.reasons.slice(0, 2).map(r =>
+        `<span style="color:#79c0ff">${_h(r.origin?.split('.').pop() || '')}</span>` +
+        ` <span style="color:#6e7681">→</span> ` +
+        `<span style="color:#c9d1d9">${_h(n.name)}</span>` +
+        (r.edge_type ? ` <span style="color:#6e7681">via ${_h(r.edge_type)}</span>` : '')
+      ).join('<br>')
+    : `Connected to <span style="color:#c9d1d9">${_h(n.name)}</span> via structural dependency.`;
+
   return `<div class="cq-node tier-${_h(tier)}" id="cqnode-${_h(n.node.replace(/[^a-z0-9]/gi,'_'))}">
     <div class="cq-header" onclick="selectNodeById('${_h(n.node)}')">
       <div class="cq-sev-dot" style="background:${dotColor}"></div>
@@ -2943,7 +3081,8 @@ function renderCqNode(n, tier) {
       <span class="cq-tier-pill cq-pill-${_h(tier)}">${pillLabel}</span>
     </div>
     ${consequence
-      ? `<div class="cq-consequence">${consequence}</div>`
+      ? `<div class="cq-consequence">${consequence}<button class="cq-why-btn" onclick="toggleWhy(this)">▾ why?</button>
+         <div class="cq-why-expanded">${whyChain}</div></div>`
       : `<div class="cq-no-consequence">No specific consequence modelled for this change type.</div>`
     }
     ${hasDetail ? `
@@ -3084,7 +3223,7 @@ async function loadDiff() {
   const resp = await fetch('/api/diff?base=main');
   const data = await resp.json();
   if (!data.impacts.length) {
-    document.getElementById('sidebar-title').textContent = 'Diff vs main';
+    document.getElementById('sidebar-title').textContent = '⎇ Diff vs main';
     document.getElementById('sidebar-content').innerHTML = `
       <div class="cq-error-card" style="border-color:#30363d;background:#161b22">
         <div class="cq-error-title" style="color:#8b949e">No changes detected</div>
@@ -3100,15 +3239,21 @@ async function loadDiff() {
       <div class="node-edge">${imp.severity} · ${imp.downstream_count} downstream</div>
     </div>`;
   });
-  document.getElementById('sidebar-title').textContent = 'Diff impact vs main';
+  document.getElementById('sidebar-title').textContent = '⎇ Diff impact vs main';
   document.getElementById('sidebar-content').innerHTML = html;
 }
 
 // Reindex
 async function reindex() {
+  const btn = document.getElementById('btn-reindex');
   document.getElementById('loading').style.display = 'block';
   document.getElementById('loading').textContent = 'Re-indexing...';
-  await fetch('/api/reindex', { method: 'POST' });
+  const resp = await fetch('/api/reindex', { method: 'POST' });
+  if (resp.status === 403) {
+    document.getElementById('loading').style.display = 'none';
+    if (btn) btn.textContent = '⚠ Disabled in production';
+    return;
+  }
   location.reload();
 }
 
@@ -3190,12 +3335,12 @@ function updateStatsBar() {
   if (viewMode === 'focus') {
     document.getElementById('stats-bar').textContent =
       `Showing ${shown} of ${total} nodes · ${allEdges.length} edges`;
-    btn.textContent = 'Focus view';
+    btn.textContent = '◎ Focus view';
     btn.classList.remove('full-mode');
   } else {
     document.getElementById('stats-bar').textContent =
       `${total} nodes · ${allEdges.length} edges (full graph)`;
-    btn.textContent = 'Full graph';
+    btn.textContent = '⊞ Full graph';
     btn.classList.add('full-mode');
   }
 }
@@ -3281,6 +3426,164 @@ function dismissAndQuery(queryText) {
   }, 300);
 }
 
+// ── Path tracing ──────────────────────────────────────────────────────────────
+
+function bfsPath(fromId, toId) {
+  // BFS over allEdges (undirected for path finding)
+  const adj = {};
+  allEdges.forEach(e => {
+    const s = e.source?.id ?? e.source;
+    const t = e.target?.id ?? e.target;
+    (adj[s] = adj[s] || []).push({ id: t, edge: e });
+    (adj[t] = adj[t] || []).push({ id: s, edge: e });
+  });
+  const queue = [[fromId]], visited = new Set([fromId]);
+  while (queue.length) {
+    const path = queue.shift();
+    const cur = path[path.length - 1];
+    for (const { id } of (adj[cur] || [])) {
+      if (visited.has(id)) continue;
+      const newPath = [...path, id];
+      if (id === toId) return newPath;
+      visited.add(id);
+      queue.push(newPath);
+    }
+  }
+  return [];
+}
+
+function animatePath(nodeIds) {
+  clearPathTrace(false);
+  const pathSet = new Set(nodeIds);
+  const edgeSet = new Set();
+  for (let i = 0; i < nodeIds.length - 1; i++) {
+    allEdges.forEach((e, idx) => {
+      const s = e.source?.id ?? e.source;
+      const t = e.target?.id ?? e.target;
+      if ((s === nodeIds[i] && t === nodeIds[i+1]) ||
+          (t === nodeIds[i] && s === nodeIds[i+1])) edgeSet.add(idx);
+    });
+  }
+
+  // Dim everything else
+  nodeEl.selectAll('circle').style('opacity', n => pathSet.has(n.id) ? 1 : 0.1);
+  nodeEl.classed('path-node', n => pathSet.has(n.id));
+  linkEl.classed('path-edge', (e, i) => edgeSet.has(i));
+  linkEl.style('stroke-opacity', (e, i) => edgeSet.has(i) ? 1 : 0.04);
+
+  // Animate the path nodes in sequence
+  nodeIds.forEach((id, i) => {
+    setTimeout(() => {
+      d3.selectAll('.node').filter(n => n.id === id)
+        .select('circle')
+        .transition().duration(200)
+        .attr('r', function() { return +d3.select(this).attr('r') * 1.6; })
+        .transition().duration(300)
+        .attr('r', function() { return +d3.select(this).attr('r') / 1.6; });
+    }, i * 150);
+  });
+
+  const from = nodeIds[0].split('.').pop();
+  const to   = nodeIds[nodeIds.length - 1].split('.').pop();
+  document.getElementById('path-trace-msg').textContent =
+    `Path: ${from} → ${to}  (${nodeIds.length - 1} hop${nodeIds.length > 2 ? 's' : ''})`;
+  document.getElementById('path-trace-bar').classList.add('visible');
+}
+
+function clearPathTrace(resetSelected = true) {
+  pathTraceTarget = null;
+  document.getElementById('path-trace-bar').classList.remove('visible');
+  nodeEl?.classed('path-node', false);
+  nodeEl?.selectAll('circle').style('opacity', null);
+  linkEl?.classed('path-edge', false);
+  linkEl?.style('stroke-opacity', null);
+  if (resetSelected) selectedNodeId = null;
+}
+
+// ── Follow-up suggestions ─────────────────────────────────────────────────────
+
+function buildFollowUps(data) {
+  const intent  = data.intent  || 'exploration';
+  const nodes   = [...(data.will_break || []), ...(data.likely_need || [])].slice(0, 3);
+  const chips   = [];
+
+  if (intent === 'decision' && data.lead?.options?.length >= 2) {
+    const [cheaper, pricier] = [...data.lead.options].sort((a,b) => a.downstream_count - b.downstream_count);
+    chips.push({
+      icon: '🔍',
+      text: `What specifically breaks if I change ${cheaper.name}?`,
+      query: `What breaks if I change ${cheaper.name}?`,
+    });
+    chips.push({
+      icon: '⚖',
+      text: `Why is ${pricier.name} more expensive structurally?`,
+      query: `Why does changing ${pricier.name} affect more nodes than ${cheaper.name}?`,
+    });
+  } else if (intent === 'specific_change' && nodes.length) {
+    chips.push({
+      icon: '🔗',
+      text: `How does ${nodes[0].name} connect to the rest of the change?`,
+      query: `What breaks if I change ${nodes[0].name}?`,
+    });
+    if (nodes.length > 1) chips.push({
+      icon: '⚡',
+      text: `Are there cross-repo consequences in this change?`,
+      query: `${data.query} — show me only cross-repo effects`,
+    });
+  } else if (intent === 'removal' && nodes.length) {
+    chips.push({
+      icon: '🚨',
+      text: `What's the safest order to remove these dependencies?`,
+      query: `What is the safest removal order for ${nodes.map(n=>n.name).join(', ')}?`,
+    });
+  }
+
+  // Always: explore most central affected node
+  if (nodes.length) {
+    chips.push({
+      icon: '🗺',
+      text: `Explore ${nodes[0].name} in the graph`,
+      query: null,
+      nodeId: nodes[0].node,
+    });
+  }
+
+  return chips.slice(0, 3);
+}
+
+function renderFollowUps(data) {
+  const chips = buildFollowUps(data);
+  if (!chips.length) return '';
+  const rows = chips.map(c => {
+    if (c.nodeId) {
+      return `<button class="followup-chip" onclick="selectNodeById('${_h(c.nodeId)}')">
+        <span class="fc-icon">${c.icon}</span>${_h(c.text)}</button>`;
+    }
+    const q = _h(c.query || '');
+    return `<button class="followup-chip" onclick="fillQueryFromFollowUp('${q}')">
+      <span class="fc-icon">${c.icon}</span>${_h(c.text)}</button>`;
+  }).join('');
+  return `<div class="followup-section">
+    <div class="followup-label">Explore further</div>
+    ${rows}
+  </div>`;
+}
+
+function fillQueryFromFollowUp(query) {
+  const ta = document.getElementById('consequence-query');
+  ta.value = query;
+  ta.focus();
+  runConsequence();
+}
+
+// ── Inline "why?" ─────────────────────────────────────────────────────────────
+
+function toggleWhy(btn) {
+  const box = btn.nextElementSibling;
+  const open = box.classList.toggle('open');
+  btn.textContent = open ? '▴ why?' : '▾ why?';
+}
+
 // ── Keep-alive ping (prevents Render free tier from spinning down) ─────────────
 // Render spins down after 15 min of inactivity. Ping /api/stats every 10 min.
 (function startKeepAlive() {
@@ -3349,7 +3652,7 @@ function buildMarkdown(data) {
   const lines = [];
   const lead = data.lead || {};
 
-  lines.push(`## Consequence analysis`);
+  lines.push(`## ⬡ Consequence analysis`);
   lines.push(`> Query: *${data.query}*`);
   lines.push('');
 
@@ -3372,9 +3675,9 @@ function buildMarkdown(data) {
   lines.push('');
 
   const tiers = [
-    { key: 'will_break',  label: 'Will break — must fix' },
-    { key: 'likely_need', label: 'Likely needs update — review before shipping' },
-    { key: 'be_aware',    label: 'In scope — broader impact area' },
+    { key: 'will_break',  label: '🔴 Will break — must fix' },
+    { key: 'likely_need', label: '🟡 Likely needs update — review before shipping' },
+    { key: 'be_aware',    label: '⚪ In scope — broader impact area' },
   ];
 
   for (const { key, label } of tiers) {
@@ -3403,7 +3706,7 @@ function copyAsMarkdown(btn, data) {
     btn.textContent = '✓ Copied';
     btn.classList.add('copied');
     setTimeout(() => {
-      btn.textContent = 'Copy as Markdown';
+      btn.textContent = '⎘ Copy as Markdown';
       btn.classList.remove('copied');
     }, 2000);
   }).catch(() => {
@@ -3416,7 +3719,7 @@ function copyAsMarkdown(btn, data) {
     document.body.removeChild(ta);
     btn.textContent = '✓ Copied';
     btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = 'Copy as Markdown'; btn.classList.remove('copied'); }, 2000);
+    setTimeout(() => { btn.textContent = '⎘ Copy as Markdown'; btn.classList.remove('copied'); }, 2000);
   });
 }
 
